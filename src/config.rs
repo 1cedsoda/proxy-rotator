@@ -15,7 +15,7 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// Proxy sets, keyed by name.
+    /// Proxy sets.
     #[serde(rename = "proxy_set")]
     pub proxy_sets: Vec<ProxySetConfig>,
 }
@@ -90,8 +90,14 @@ pub fn load_proxies(path: &Path) -> Result<Vec<UpstreamProxy>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (host, port) = parse_host_port(line)
-            .with_context(|| format!("{}:{}: invalid proxy entry '{}'", path.display(), i + 1, line))?;
+        let (host, port) = parse_host_port(line).with_context(|| {
+            format!(
+                "{}:{}: invalid proxy entry '{}'",
+                path.display(),
+                i + 1,
+                line
+            )
+        })?;
         proxies.push(UpstreamProxy { host, port });
     }
     Ok(proxies)

@@ -20,4 +20,4 @@ session_affinity_secs = 300       # same client IP → same proxy for 5 minutes
 [[proxy_set]]
 name = "datacenter"
 proxies_file = "proxies/datacenter.txt"
-session_affinity_secs = 0         # pure round-robin, no affinity
+session_affinity_secs = 0         # pure least-used rotation

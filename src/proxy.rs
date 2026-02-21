@@ -240,7 +240,8 @@ async fn handle_http(
 
     let body_bytes = req.collect().await?.to_bytes().to_vec();
 
-    let response_bytes = tunnel::forward_http(&method, &uri, &headers, &body_bytes, upstream).await?;
+    let response_bytes =
+        tunnel::forward_http(&method, &uri, &headers, &body_bytes, upstream).await?;
 
     parse_raw_response(&response_bytes)
 }

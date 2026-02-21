@@ -71,7 +71,8 @@ pub async fn forward_http(
 fn proxy_auth_header(upstream: &ResolvedProxy) -> Option<String> {
     let username = upstream.username.as_deref()?;
     let password = upstream.password.as_deref().unwrap_or("");
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
     Some(format!("Basic {encoded}"))
 }
 

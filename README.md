@@ -1,6 +1,6 @@
 # proxy-rotator
 
-A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with round-robin rotation and optional session affinity.
+A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation and optional session affinity.
 
 ## Architecture
 
@@ -10,8 +10,8 @@ Client ──HTTP/CONNECT──→ proxy-rotator ──→ upstream proxy pool �
 
 - **No TLS termination** — raw bytes are relayed through CONNECT tunnels. The client's own TLS handshake reaches the destination untouched.
 - Multiple **proxy sets** — each with its own pool of upstream proxies, rotation strategy, and optional credentials.
+- **Least-used rotation** — requests go to the proxy with the lowest use count, with random tie-breaking among equally-used proxies.
 - **Session affinity** — optionally pin a client IP to the same upstream proxy for a configurable duration.
-- **Round-robin** — when no affinity is active, requests rotate through the pool.
 
 ## Configuration
 
@@ -31,7 +31,7 @@ upstream_password = "pass456"       # optional: sent to upstream proxies
 [[proxy_set]]
 name = "datacenter"
 proxies_file = "proxies/datacenter.txt"
-session_affinity_secs = 0           # pure round-robin
+session_affinity_secs = 0           # pure least-used rotation
 ```
 
 ### Proxy list files
@@ -87,23 +87,34 @@ curl -x http://127.0.0.1:8100 https://httpbin.org/ip
 
 1. Client connects and sends an HTTP request or CONNECT tunnel request
 2. The proxy set is selected from `Proxy-Authorization: Basic base64(set_name:)`
-3. An upstream proxy is chosen via round-robin (or session affinity if configured)
+3. An upstream proxy is chosen using **least-used rotation** (lowest use count, random tie-breaking)
 4. For **CONNECT**: a tunnel is established through the upstream proxy, then raw bytes are relayed bidirectionally — no TLS breaking
 5. For **plain HTTP**: the request is forwarded through the upstream proxy with the absolute URI
 
-### Session Affinity
+### Least-used rotation
 
-When `session_affinity_secs > 0`, the first request from a client IP gets assigned an upstream proxy via round-robin. Subsequent requests from the same IP reuse the same upstream proxy until the affinity window expires. Expired entries are cleaned up every 60 seconds.
+Every proxy tracks a use counter. On each request, the rotator:
+1. Finds the minimum use count across all proxies in the set
+2. Collects all proxies with that minimum count
+3. Picks one at random from the candidates
+
+This ensures even distribution while avoiding predictable patterns.
+
+### Session affinity
+
+When `session_affinity_secs > 0`, the first request from a client IP gets assigned an upstream proxy via least-used selection. Subsequent requests from the same IP reuse that proxy until the affinity window expires. Expired entries are cleaned up every 60 seconds.
 
 ## Docker
 
 ```bash
 docker build -t proxy-rotator .
 docker run -p 8100:8100 \
-  -v ./config.toml:/app/config.toml:ro \
-  -v ./proxies:/app/proxies:ro \
+  -v ./config.toml:/data/config/config.toml:ro \
+  -v ./proxies:/data/config/proxies:ro \
   proxy-rotator
 ```
+
+Pre-built images: `ghcr.io/<owner>/proxy-rotator`
 
 ## Building
 
