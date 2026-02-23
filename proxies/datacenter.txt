@@ -1,6 +1,0 @@
-# Datacenter proxy pool
-# Format: host:port:username:password (or host:port for no auth)
-45.67.89.101:3128:dcuser:dcpass123
-45.67.89.102:3128:dcuser:dcpass123
-45.67.89.103:3128:dcuser:dcpass123
-45.67.89.104:3128:dcuser:dcpass123

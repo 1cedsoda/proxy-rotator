@@ -1,5 +1,0 @@
-# Residential proxy pool
-# Format: host:port:username:password
-150.241.111.154:6658:dlipsdjpstaticresidential:epzji8na3wlr
-82.23.88.116:7872:dlipsdjpstaticresidential:epzji8na3wlr
-91.134.52.73:5432:dlipsdjpstaticresidential:epzji8na3wlr
