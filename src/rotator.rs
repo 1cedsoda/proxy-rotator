@@ -86,6 +86,32 @@ pub struct ApiError {
     pub error: String,
 }
 
+/// Result of a username verification check.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct VerifyResult {
+    /// Whether all checks passed.
+    #[schema(example = true)]
+    pub ok: bool,
+    /// The proxy set name parsed from the username.
+    #[schema(example = "residential")]
+    pub proxy_set: String,
+    /// Affinity minutes parsed from the username.
+    #[schema(example = 60)]
+    pub minutes: u16,
+    /// The decoded metadata object from the username.
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// The upstream proxy that would be used (host:port).
+    #[schema(example = "198.51.100.1:6658")]
+    pub upstream: String,
+    /// The outbound IP address as seen by the internet, fetched through the proxy.
+    #[schema(example = "198.51.100.1")]
+    pub ip: String,
+    /// Error message if any check failed, absent when ok=true.
+    #[schema(example = "Unknown proxy set 'badset'")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl Rotator {
     /// Build from loaded proxy sets.
     pub fn new(sets: Vec<ProxySet>) -> Self {
@@ -126,6 +152,20 @@ impl Rotator {
     ) -> Option<ResolvedProxy> {
         let set = self.sets.iter().find(|s| s.name == set_name)?;
         let proxy = set.pick(affinity_minutes, meta_b64, metadata, &self.next_session_id);
+        Some(ResolvedProxy {
+            host: proxy.host.clone(),
+            port: proxy.port,
+            username: proxy.username.clone(),
+            password: proxy.password.clone(),
+        })
+    }
+
+    /// Pick a proxy from a named set without creating an affinity entry.
+    /// Used for pre-flight verification checks.
+    pub fn pick_any(&self, set_name: &str) -> Option<ResolvedProxy> {
+        let set = self.sets.iter().find(|s| s.name == set_name)?;
+        let idx = set.pick_least_used();
+        let proxy = &set.proxies[idx].proxy;
         Some(ResolvedProxy {
             host: proxy.host.clone(),
             port: proxy.port,

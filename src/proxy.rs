@@ -93,6 +93,38 @@ struct ProxyAuth {
     metadata: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Public parsed fields from a username, returned by `parse_proxy_auth_value_for_verify`.
+pub struct ParsedUsername {
+    pub set_name: String,
+    pub affinity_minutes: u16,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Parse a raw base64 username string directly (no Basic auth wrapper).
+/// Used by the verify endpoint which receives the username directly in the path.
+pub fn parse_proxy_auth_value_for_verify(username_b64: &str) -> Result<ParsedUsername, String> {
+    // Reconstruct a fake Basic auth header value so we can reuse the full parser.
+    use base64::Engine;
+    let faked = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:",
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(username_b64)
+                    .map_err(|_| "Invalid base64 in username")?
+            )
+            .map_err(|_| "Invalid UTF-8 in username")?
+        ))
+    );
+    let auth = parse_proxy_auth_value(&faked)?;
+    Ok(ParsedUsername {
+        set_name: auth.set_name,
+        affinity_minutes: auth.affinity_minutes,
+        metadata: auth.metadata,
+    })
+}
+
 /// Extract and parse the Proxy-Authorization header from a request.
 fn parse_proxy_auth(req: &Request<Incoming>) -> Result<ProxyAuth, String> {
     let header_val = req
@@ -260,7 +292,7 @@ async fn handle_request(
     if req.method() != Method::CONNECT {
         let path = req.uri().path();
         if path.starts_with("/api/") {
-            return Ok(handle_api_request(&req, &rotator, &api_key));
+            return Ok(handle_api_request(&req, &rotator, &api_key).await);
         }
     }
 
@@ -446,7 +478,7 @@ fn parse_raw_response(raw: &[u8]) -> Result<Response<BoxBody<Bytes, hyper::Error
 // API routing
 // ---------------------------------------------------------------------------
 
-fn handle_api_request(
+async fn handle_api_request(
     req: &Request<Incoming>,
     rotator: &Rotator,
     api_key: &Option<String>,
@@ -491,10 +523,11 @@ fn handle_api_request(
     if path == "/api/sessions" {
         api::list_sessions(rotator)
     } else if let Some(raw) = path.strip_prefix("/api/sessions/") {
-        // The path segment is the URL-percent-encoded username_b64.
-        // Percent-decode it to recover the original base64 string.
         let username_b64 = percent_decode(raw);
         api::get_session(rotator, &username_b64)
+    } else if let Some(raw) = path.strip_prefix("/api/verify/") {
+        let username_b64 = percent_decode(raw);
+        api::verify_username(rotator, &username_b64).await
     } else {
         api::json_response(StatusCode::NOT_FOUND, r#"{"error":"Not found"}"#)
     }

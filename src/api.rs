@@ -3,7 +3,7 @@
 //! Each public handler function is annotated with `#[utoipa::path]` to generate
 //! the OpenAPI documentation. These are the real handlers called from `proxy.rs`.
 
-use crate::rotator::{ApiError, Rotator, SessionInfo};
+use crate::rotator::{ApiError, Rotator, SessionInfo, VerifyResult};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{Response, StatusCode};
@@ -71,6 +71,138 @@ pub fn get_session(rotator: &Rotator, username: &str) -> Response<BoxBody<Bytes,
     }
 }
 
+/// Verify a proxy username
+///
+/// Parses the username, checks the proxy set exists, picks an upstream proxy,
+/// connects through it, and returns the outbound IP. This is a pre-flight check
+/// that runs before any session is created — it does not create affinity entries.
+///
+/// The username is the percent-encoded base64 string in the path.
+#[utoipa::path(
+    get,
+    path = "/api/verify/{username}",
+    params(
+        ("username" = String, Path, description = "Percent-encoded base64 username to verify"),
+    ),
+    responses(
+        (status = 200, description = "Verification result (check ok field)", body = VerifyResult),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
+    ),
+    security(
+        ("bearer" = [])
+    )
+)]
+pub async fn verify_username(
+    rotator: &Rotator,
+    username_b64: &str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    use crate::proxy::parse_proxy_auth_value_for_verify;
+
+    // 1. Parse the username JSON.
+    let auth = match parse_proxy_auth_value_for_verify(username_b64) {
+        Ok(a) => a,
+        Err(e) => {
+            let result = VerifyResult {
+                ok: false,
+                proxy_set: String::new(),
+                minutes: 0,
+                metadata: serde_json::Map::new(),
+                upstream: String::new(),
+                ip: String::new(),
+                error: Some(format!("Invalid username: {e}")),
+            };
+            return json_response(
+                StatusCode::OK,
+                &serde_json::to_string(&result).unwrap(),
+            );
+        }
+    };
+
+    // 2. Check the proxy set exists and pick a proxy without creating a session.
+    let upstream = match rotator.pick_any(&auth.set_name) {
+        Some(p) => p,
+        None => {
+            let result = VerifyResult {
+                ok: false,
+                proxy_set: auth.set_name.clone(),
+                minutes: auth.affinity_minutes,
+                metadata: auth.metadata,
+                upstream: String::new(),
+                ip: String::new(),
+                error: Some(format!(
+                    "Unknown proxy set '{}'. Available: {:?}",
+                    auth.set_name,
+                    rotator.set_names()
+                )),
+            };
+            return json_response(
+                StatusCode::OK,
+                &serde_json::to_string(&result).unwrap(),
+            );
+        }
+    };
+
+    let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
+
+    // 3. Fetch the outbound IP through the proxy.
+    let ip = fetch_ip_through_proxy(&upstream).await;
+
+    match ip {
+        Ok(ip) => {
+            let result = VerifyResult {
+                ok: true,
+                proxy_set: auth.set_name,
+                minutes: auth.affinity_minutes,
+                metadata: auth.metadata,
+                upstream: upstream_addr,
+                ip,
+                error: None,
+            };
+            json_response(StatusCode::OK, &serde_json::to_string(&result).unwrap())
+        }
+        Err(e) => {
+            let result = VerifyResult {
+                ok: false,
+                proxy_set: auth.set_name,
+                minutes: auth.affinity_minutes,
+                metadata: auth.metadata,
+                upstream: upstream_addr,
+                ip: String::new(),
+                error: Some(format!("Proxy connectivity check failed: {e}")),
+            };
+            json_response(StatusCode::OK, &serde_json::to_string(&result).unwrap())
+        }
+    }
+}
+
+/// Fetch the outbound IP via api.ipify.org through the given upstream proxy.
+async fn fetch_ip_through_proxy(
+    upstream: &crate::rotator::ResolvedProxy,
+) -> anyhow::Result<String> {
+    let raw = crate::tunnel::forward_http(
+        "GET",
+        "http://api.ipify.org/?format=text",
+        &[("Host".to_string(), "api.ipify.org".to_string())],
+        &[],
+        upstream,
+    )
+    .await?;
+
+    // forward_http returns a raw HTTP response — extract the body after \r\n\r\n
+    let sep = b"\r\n\r\n";
+    let body_start = raw
+        .windows(sep.len())
+        .position(|w| w == sep)
+        .map(|p| p + sep.len())
+        .unwrap_or(raw.len());
+    let ip = String::from_utf8_lossy(&raw[body_start..]).trim().to_string();
+
+    if ip.is_empty() {
+        anyhow::bail!("Empty response from ip check");
+    }
+    Ok(ip)
+}
+
 /// Get the OpenAPI spec
 ///
 /// Returns the OpenAPI 3.1 JSON specification for this API.
@@ -93,9 +225,10 @@ pub fn openapi_spec() -> Response<BoxBody<Bytes, hyper::Error>> {
     paths(
         list_sessions,
         get_session,
+        verify_username,
     ),
     components(
-        schemas(SessionInfo, ApiError),
+        schemas(SessionInfo, ApiError, VerifyResult),
     ),
     modifiers(&SecurityAddon),
 )]
