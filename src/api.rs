@@ -219,7 +219,7 @@ pub fn openapi_spec() -> Response<BoxBody<Bytes, hyper::Error>> {
 #[openapi(
     info(
         title = "Proxy Rotator API",
-        version = "0.5.0",
+        version = "0.6.0",
         description = "API for inspecting active proxy sessions in proxy-rotator.\n\nAuthenticate with `Authorization: Bearer <api_key>` where `api_key` is set via the `API_KEY` environment variable.",
     ),
     paths(
