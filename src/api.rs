@@ -36,12 +36,12 @@ pub fn list_sessions(rotator: &Rotator) -> Response<BoxBody<Bytes, hyper::Error>
 /// Get session by username
 ///
 /// Returns details of a specific active session identified by its full username
-/// in the format `<proxyset>-<minutes>-<sessionkey>`.
+/// in the format `<proxyset>-<minutes>-<base64json>`.
 #[utoipa::path(
     get,
     path = "/api/sessions/{username}",
     params(
-        ("username" = String, Path, description = "Full username in format <proxyset>-<minutes>-<sessionkey>", example = "residential-5-abc123"),
+        ("username" = String, Path, description = "Full username in format <proxyset>-<minutes>-<base64json>", example = "residential-5-eyJhcHAiOiJteWFwcCIsInVzZXIiOiJhbGljZSJ9"),
     ),
     responses(
         (status = 200, description = "Session found", body = SessionInfo),
@@ -66,7 +66,7 @@ pub fn get_session(rotator: &Rotator, username: &str) -> Response<BoxBody<Bytes,
         }
         None => json_response(
             StatusCode::NOT_FOUND,
-            &format!(r#"{{"error":"No active session for '{}'"}}"#, username),
+            &format!(r#"{{"error":"No active session for '{}'"}}  "#, username),
         ),
     }
 }
@@ -87,7 +87,7 @@ pub fn openapi_spec() -> Response<BoxBody<Bytes, hyper::Error>> {
 #[openapi(
     info(
         title = "Proxy Rotator API",
-        version = "0.4.0",
+        version = "0.5.0",
         description = "API for inspecting active proxy sessions in proxy-rotator.\n\nAuthenticate with `Authorization: Bearer <api_key>` where `api_key` is set via the `API_KEY` environment variable.",
     ),
     paths(
@@ -185,5 +185,20 @@ mod tests {
         assert!(parsed["paths"]["/api/sessions/{username}"].is_object());
         assert!(parsed["components"]["schemas"]["SessionInfo"].is_object());
         assert!(parsed["components"]["schemas"]["ApiError"].is_object());
+
+        // Verify the new fields appear in the SessionInfo schema.
+        let session_props = &parsed["components"]["schemas"]["SessionInfo"]["properties"];
+        assert!(
+            session_props["session_id"].is_object(),
+            "SessionInfo should have session_id field"
+        );
+        assert!(
+            session_props["metadata"].is_object(),
+            "SessionInfo should have metadata field"
+        );
+        assert!(
+            session_props["username"].is_object(),
+            "SessionInfo should still have username field"
+        );
     }
 }

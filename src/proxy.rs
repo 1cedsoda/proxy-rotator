@@ -26,12 +26,14 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>, api_key: Option<S
             info!("  set '{}': {} proxies", name, count);
         }
     }
-    info!("Usage: Proxy-Authorization: Basic base64(<proxyset>-<minutes>-<sessionkey>:)");
-    info!("  proxyset: alphanumeric proxy set name");
-    info!("  minutes: 0 (rotate every request) to 1440 (24h sticky session)");
-    info!("  sessionkey: alphanumeric session identifier");
+    info!("Usage: Proxy-Authorization: Basic base64(<json>:)");
+    info!("  The username is a single base64-encoded JSON object with three required keys:");
+    info!("    meta    : flat object with string/number values");
+    info!("    minutes : integer 0–1440 (0 = rotate every request)");
+    info!("    set     : proxy set name (alphanumeric)");
+    info!(r#"  Example: base64({{"meta":{{"app":"myapp"}},"minutes":5,"set":"residential"}}:)"#);
     if api_key.is_some() {
-        info!("API endpoints enabled: GET /api/sessions, GET /api/sessions/:username");
+        info!("API endpoints enabled: GET /api/sessions, GET /api/sessions/:username_b64");
     } else {
         info!("API endpoints disabled (no api_key configured)");
     }
@@ -78,11 +80,17 @@ pub async fn run_proxy(bind_addr: &str, rotator: Arc<Rotator>, api_key: Option<S
 // Proxy-Authorization parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed proxy authorization: proxy set name, affinity minutes, and session key.
+/// Parsed proxy authorization, decoded from the single base64-JSON username.
+#[derive(Debug)]
 struct ProxyAuth {
     set_name: String,
     affinity_minutes: u16,
-    session_key: String,
+    /// The raw base64 username string — used as the affinity map key.
+    /// Because it encodes all three fields, identical inputs always produce the
+    /// same key, giving stable session affinity.
+    username_b64: String,
+    /// The decoded `meta` sub-object.
+    metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Extract and parse the Proxy-Authorization header from a request.
@@ -97,87 +105,145 @@ fn parse_proxy_auth(req: &Request<Incoming>) -> Result<ProxyAuth, String> {
 }
 
 /// Parse a Proxy-Authorization header value.
-/// Format: `Basic base64(<proxyset>-<minutes>-<sessionkey>:)`
 ///
-/// All three parts are required. The format is strictly:
-///   - proxyset: alphanumeric only (no hyphens)
-///   - minutes: numeric only, 0..=1440
-///   - sessionkey: alphanumeric only (no hyphens)
+/// The username is a base64-encoded JSON object (password is unused):
 ///
-/// Password (after the colon) is unused/empty.
+/// ```text
+/// Basic base64({"meta":{...},"minutes":5,"set":"residential"}:)
+/// ```
+///
+/// Rules:
+///   - Must be a JSON object with exactly three keys: `meta`, `minutes`, `set`.
+///   - `meta`    : flat JSON object; values must be strings or numbers
+///                 (no booleans, nulls, arrays, or nested objects).
+///   - `minutes` : integer 0..=1440.
+///   - `set`     : non-empty alphanumeric string.
+///   - No extra keys are allowed.
 fn parse_proxy_auth_value(header_val: &str) -> Result<ProxyAuth, String> {
     let b64 = header_val
         .strip_prefix("Basic ")
         .ok_or("Proxy-Authorization must be Basic auth")?;
-    let decoded = base64::engine::general_purpose::STANDARD
+
+    let decoded_bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|_| "Invalid base64 in Proxy-Authorization")?;
     let decoded_str =
-        String::from_utf8(decoded).map_err(|_| "Invalid UTF-8 in Proxy-Authorization")?;
+        String::from_utf8(decoded_bytes).map_err(|_| "Invalid UTF-8 in Proxy-Authorization")?;
 
-    // Standard Basic auth: split on first ':' to get the username part.
-    let username = match decoded_str.find(':') {
+    // Strip the Basic-auth ":password" suffix to get the raw username JSON.
+    // Use rfind(':') — the separator colon is always the last one, since the
+    // JSON itself contains colons inside key-value pairs.
+    let username_json = match decoded_str.rfind(':') {
         Some(idx) => &decoded_str[..idx],
         None => decoded_str.as_str(),
     };
 
-    if username.is_empty() {
+    if username_json.is_empty() {
         return Err("Empty username in Proxy-Authorization".to_string());
     }
 
-    // Split username on '-' — must have exactly 3 parts: proxyset-minutes-sessionkey
-    let parts: Vec<&str> = username.splitn(3, '-').collect();
-    if parts.len() != 3 {
+    // Parse as JSON.
+    let value: serde_json::Value = serde_json::from_str(username_json)
+        .map_err(|e| format!("Username is not valid JSON: {e}"))?;
+
+    let obj = match value {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            return Err(
+                r#"Username JSON must be an object, e.g. {"meta":{...},"minutes":5,"set":"residential"}"#
+                    .to_string(),
+            )
+        }
+    };
+
+    // Require exactly the three expected keys — no more, no less.
+    let expected_keys = ["meta", "minutes", "set"];
+    for key in expected_keys {
+        if !obj.contains_key(key) {
+            return Err(format!(
+                "Username JSON is missing required key '{}'. Required keys: 'meta', 'minutes', 'set'.",
+                key
+            ));
+        }
+    }
+    if obj.len() != 3 {
+        let extra: Vec<&str> = obj.keys()
+            .map(String::as_str)
+            .filter(|k| !expected_keys.contains(k))
+            .collect();
         return Err(format!(
-            "Invalid username format '{}'. Expected: <proxyset>-<minutes>-<sessionkey>",
-            username
+            "Username JSON has unexpected keys: {:?}. Only 'meta', 'minutes', 'set' are allowed.",
+            extra
         ));
     }
 
-    let set_name = parts[0];
-    let minutes_str = parts[1];
-    let session_key = parts[2];
-
-    // Validate proxyset: non-empty, alphanumeric only
+    // Validate `set`.
+    let set_name = match obj.get("set") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => return Err("'set' must be a string".to_string()),
+    };
     if set_name.is_empty() || !set_name.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(
-            "Invalid proxy set name '{}'. Must be non-empty and alphanumeric only (no hyphens).",
+            "Invalid proxy set name '{}'. Must be non-empty and alphanumeric only.",
             set_name
         ));
     }
 
-    // Validate minutes: numeric only, 0..=1440
-    if minutes_str.is_empty() || !minutes_str.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!(
-            "Invalid minutes '{}'. Must be a number 0-1440.",
-            minutes_str
-        ));
-    }
-    let minutes: u16 = minutes_str.parse::<u16>().map_err(|_| {
-        format!(
-            "Invalid minutes '{}'. Must be a number 0-1440.",
-            minutes_str
-        )
-    })?;
+    // Validate `minutes`.
+    let minutes: u16 = match obj.get("minutes") {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or_else(|| "'minutes' must be an integer 0–1440".to_string())?,
+        _ => return Err("'minutes' must be an integer 0–1440".to_string()),
+    };
     if minutes > 1440 {
         return Err(format!(
-            "Minutes {} exceeds maximum of 1440 (24 hours).",
+            "'minutes' {} exceeds maximum of 1440 (24 hours).",
             minutes
         ));
     }
 
-    // Validate session key: non-empty, alphanumeric only
-    if session_key.is_empty() || !session_key.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!(
-            "Invalid session key '{}'. Must be non-empty and alphanumeric only (no hyphens).",
-            session_key
-        ));
+    // Validate `meta`.
+    let meta_obj = match obj.get("meta") {
+        Some(serde_json::Value::Object(m)) => m.clone(),
+        _ => return Err("'meta' must be a JSON object".to_string()),
+    };
+    for (key, val) in &meta_obj {
+        match val {
+            serde_json::Value::String(_) | serde_json::Value::Number(_) => {}
+            serde_json::Value::Bool(_) => {
+                return Err(format!(
+                    "'meta.{}' has a boolean value. Only string and number values are allowed.",
+                    key
+                ));
+            }
+            serde_json::Value::Null => {
+                return Err(format!(
+                    "'meta.{}' has a null value. Only string and number values are allowed.",
+                    key
+                ));
+            }
+            serde_json::Value::Array(_) => {
+                return Err(format!(
+                    "'meta.{}' has an array value. Only string and number values are allowed.",
+                    key
+                ));
+            }
+            serde_json::Value::Object(_) => {
+                return Err(format!(
+                    "'meta.{}' has a nested object value. Only string and number values are allowed.",
+                    key
+                ));
+            }
+        }
     }
 
     Ok(ProxyAuth {
-        set_name: set_name.to_string(),
+        set_name,
         affinity_minutes: minutes,
-        session_key: session_key.to_string(),
+        username_b64: b64.to_string(),
+        metadata: meta_obj,
     })
 }
 
@@ -191,7 +257,6 @@ async fn handle_request(
     peer: SocketAddr,
     api_key: Arc<Option<String>>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
-    // Check if this is an API request (non-CONNECT with /api/ path).
     if req.method() != Method::CONNECT {
         let path = req.uri().path();
         if path.starts_with("/api/") {
@@ -218,7 +283,6 @@ async fn handle_request_inner(
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     let client_ip = peer.ip();
 
-    // Parse the proxy auth: <proxyset>-<minutes>-<sessionkey>
     let auth = match parse_proxy_auth(&req) {
         Ok(auth) => auth,
         Err(msg) => {
@@ -229,15 +293,19 @@ async fn handle_request_inner(
                 "Auth error: {msg}"
             );
             return Ok(proxy_auth_error(&format!(
-                "{}. Format: <proxyset>-<minutes>-<sessionkey>. Available sets: {:?}",
+                r#"{}. Expected: Basic base64({{"meta":{{...}},"minutes":<0-1440>,"set":"<proxyset>"}}:). Available sets: {:?}"#,
                 msg,
                 rotator.set_names()
             )));
         }
     };
 
-    // Resolve the next upstream proxy.
-    let upstream = match rotator.next_proxy(&auth.set_name, auth.affinity_minutes, &auth.session_key) {
+    let upstream = match rotator.next_proxy(
+        &auth.set_name,
+        auth.affinity_minutes,
+        &auth.username_b64,
+        auth.metadata,
+    ) {
         Some(p) => p,
         None => {
             warn!(
@@ -262,7 +330,6 @@ async fn handle_request_inner(
         uri = %req.uri(),
         set = %auth.set_name,
         minutes = auth.affinity_minutes,
-        session = %auth.session_key,
         upstream = %format!("{}:{}", upstream.host, upstream.port),
         client = %client_ip,
         "Routing request"
@@ -322,7 +389,6 @@ async fn handle_http(
     let method = req.method().to_string();
     let uri = req.uri().to_string();
 
-    // Collect headers, stripping our Proxy-Authorization.
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -380,8 +446,6 @@ fn parse_raw_response(raw: &[u8]) -> Result<Response<BoxBody<Bytes, hyper::Error
 // API routing
 // ---------------------------------------------------------------------------
 
-/// Route `/api/*` requests to the appropriate handler in `crate::api`.
-/// `/api/openapi.json` is publicly accessible; all others require Bearer auth.
 fn handle_api_request(
     req: &Request<Incoming>,
     rotator: &Rotator,
@@ -391,7 +455,6 @@ fn handle_api_request(
 
     let path = req.uri().path();
 
-    // Only GET is allowed for all API routes.
     if req.method() != Method::GET {
         return api::json_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -399,12 +462,10 @@ fn handle_api_request(
         );
     }
 
-    // OpenAPI spec — publicly accessible, no auth needed.
     if path == "/api/openapi.json" {
         return api::openapi_spec();
     }
 
-    // All other /api/ endpoints require API_KEY to be configured.
     let expected_key = match api_key {
         Some(key) => key,
         None => {
@@ -415,7 +476,6 @@ fn handle_api_request(
         }
     };
 
-    // Validate Bearer token.
     let auth_ok = req
         .headers()
         .get("authorization")
@@ -428,14 +488,37 @@ fn handle_api_request(
         return api::unauthorized_response();
     }
 
-    // Dispatch to the matching handler.
     if path == "/api/sessions" {
         api::list_sessions(rotator)
-    } else if let Some(username) = path.strip_prefix("/api/sessions/") {
-        api::get_session(rotator, username)
+    } else if let Some(raw) = path.strip_prefix("/api/sessions/") {
+        // The path segment is the URL-percent-encoded username_b64.
+        // Percent-decode it to recover the original base64 string.
+        let username_b64 = percent_decode(raw);
+        api::get_session(rotator, &username_b64)
     } else {
         api::json_response(StatusCode::NOT_FOUND, r#"{"error":"Not found"}"#)
     }
+}
+
+/// Minimal percent-decoding for URL path segments (handles %XX sequences).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = char::from(bytes[i + 1]).to_digit(16);
+            let lo = char::from(bytes[i + 2]).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(char::from((h * 16 + l) as u8));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(char::from(bytes[i]));
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -476,92 +559,91 @@ fn proxy_auth_error(message: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
-    /// Helper to build a Basic auth header value from a username.
-    fn auth_header(username: &str) -> String {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:"));
+    /// Wrap a JSON string as a Basic auth header value (username = json, password = "").
+    fn auth_header(username_json: &str) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{username_json}:"));
         format!("Basic {encoded}")
     }
 
+    /// Build a valid username JSON string from parts.
+    fn make_username(set: &str, minutes: u64, meta_json: &str) -> String {
+        format!(r#"{{"meta":{meta_json},"minutes":{minutes},"set":"{set}"}}"#)
+    }
+
+    // -----------------------------------------------------------------------
+    // Valid cases
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_valid_username() {
-        let auth = parse_proxy_auth_value(&auth_header("residential-5-abc123")).unwrap();
+    fn test_valid_basic() {
+        let u = make_username("residential", 5, r#"{"app":"myapp","user":"alice"}"#);
+        let auth = parse_proxy_auth_value(&auth_header(&u)).unwrap();
         assert_eq!(auth.set_name, "residential");
         assert_eq!(auth.affinity_minutes, 5);
-        assert_eq!(auth.session_key, "abc123");
+        assert_eq!(auth.metadata["app"], serde_json::Value::String("myapp".to_string()));
+        assert_eq!(auth.metadata["user"], serde_json::Value::String("alice".to_string()));
     }
 
     #[test]
-    fn test_zero_minutes() {
-        let auth = parse_proxy_auth_value(&auth_header("datacenter-0-sess1")).unwrap();
-        assert_eq!(auth.set_name, "datacenter");
+    fn test_valid_mixed_meta_values() {
+        let u = make_username("datacenter", 10, r#"{"count":42,"name":"test"}"#);
+        let auth = parse_proxy_auth_value(&auth_header(&u)).unwrap();
+        assert_eq!(auth.affinity_minutes, 10);
+        assert_eq!(auth.metadata["count"], serde_json::Value::Number(42.into()));
+    }
+
+    #[test]
+    fn test_valid_empty_meta() {
+        let u = make_username("residential", 0, "{}");
+        let auth = parse_proxy_auth_value(&auth_header(&u)).unwrap();
         assert_eq!(auth.affinity_minutes, 0);
-        assert_eq!(auth.session_key, "sess1");
+        assert!(auth.metadata.is_empty());
     }
 
     #[test]
-    fn test_max_minutes() {
-        let auth = parse_proxy_auth_value(&auth_header("residential-1440-mykey")).unwrap();
+    fn test_valid_zero_minutes() {
+        let u = make_username("datacenter", 0, r#"{"k":"v"}"#);
+        let auth = parse_proxy_auth_value(&auth_header(&u)).unwrap();
+        assert_eq!(auth.affinity_minutes, 0);
+    }
+
+    #[test]
+    fn test_valid_max_minutes() {
+        let u = make_username("residential", 1440, r#"{"k":"v"}"#);
+        let auth = parse_proxy_auth_value(&auth_header(&u)).unwrap();
         assert_eq!(auth.affinity_minutes, 1440);
     }
 
     #[test]
-    fn test_minutes_too_high() {
-        assert!(parse_proxy_auth_value(&auth_header("residential-1441-mykey")).is_err());
+    fn test_meta_any_key_order_accepted() {
+        // Keys in any order should be fine now
+        let u = make_username("residential", 5, r#"{"z":"last","a":"first","m":"mid"}"#);
+        assert!(parse_proxy_auth_value(&auth_header(&u)).is_ok());
     }
 
     #[test]
-    fn test_missing_parts() {
-        // Only one part (no hyphens)
-        assert!(parse_proxy_auth_value(&auth_header("residential")).is_err());
-        // Only two parts
-        assert!(parse_proxy_auth_value(&auth_header("residential-5")).is_err());
+    fn test_outer_keys_any_order_accepted() {
+        // Outer keys in any order are fine — presence check only
+        let u = r#"{"set":"residential","meta":{},"minutes":5}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_ok());
+        let u2 = r#"{"minutes":5,"set":"residential","meta":{}}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u2)).is_ok());
     }
 
     #[test]
-    fn test_hyphen_in_proxyset() {
-        // splitn(3, '-') → ["resi", "dential", "5-abc123"]
-        // "dential" is not numeric → error
-        assert!(parse_proxy_auth_value(&auth_header("resi-dential-5-abc123")).is_err());
+    fn test_username_b64_is_stable() {
+        let u = make_username("residential", 5, r#"{"app":"myapp"}"#);
+        let a = parse_proxy_auth_value(&auth_header(&u)).unwrap();
+        let b = parse_proxy_auth_value(&auth_header(&u)).unwrap();
+        assert_eq!(a.username_b64, b.username_b64);
     }
 
-    #[test]
-    fn test_hyphen_in_session_key() {
-        // splitn(3, '-') → ["residential", "5", "abc-123"]
-        // "abc-123" has a hyphen → not alphanumeric → error
-        assert!(parse_proxy_auth_value(&auth_header("residential-5-abc-123")).is_err());
-    }
-
-    #[test]
-    fn test_non_alphanumeric_proxyset() {
-        assert!(parse_proxy_auth_value(&auth_header("resi_dential-5-abc123")).is_err());
-    }
-
-    #[test]
-    fn test_non_alphanumeric_session_key() {
-        assert!(parse_proxy_auth_value(&auth_header("residential-5-abc_123")).is_err());
-    }
-
-    #[test]
-    fn test_non_numeric_minutes() {
-        assert!(parse_proxy_auth_value(&auth_header("residential-abc-sess1")).is_err());
-    }
-
-    #[test]
-    fn test_empty_proxyset() {
-        assert!(parse_proxy_auth_value(&auth_header("-5-sess1")).is_err());
-    }
-
-    #[test]
-    fn test_empty_session_key() {
-        assert!(parse_proxy_auth_value(&auth_header("residential-5-")).is_err());
-    }
-
-    #[test]
-    fn test_empty_minutes() {
-        assert!(parse_proxy_auth_value(&auth_header("residential--sess1")).is_err());
-    }
+    // -----------------------------------------------------------------------
+    // Outer object structure
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_not_basic_auth() {
@@ -571,5 +653,131 @@ mod tests {
     #[test]
     fn test_empty_username() {
         assert!(parse_proxy_auth_value(&auth_header("")).is_err());
+    }
+
+    #[test]
+    fn test_not_json_object() {
+        assert!(parse_proxy_auth_value(&auth_header("hello")).is_err());
+        assert!(parse_proxy_auth_value(&auth_header("[1,2,3]")).is_err());
+    }
+
+    #[test]
+    fn test_missing_key_set() {
+        let u = r#"{"meta":{},"minutes":5}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_missing_key_minutes() {
+        let u = r#"{"meta":{},"set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_missing_key_meta() {
+        let u = r#"{"minutes":5,"set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_extra_key_rejected() {
+        let u = r#"{"extra":"x","meta":{},"minutes":5,"set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // `set` validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_empty_rejected() {
+        let u = r#"{"meta":{},"minutes":5,"set":""}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_set_non_alphanumeric_rejected() {
+        let u = r#"{"meta":{},"minutes":5,"set":"resi-dential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_set_not_string_rejected() {
+        let u = r#"{"meta":{},"minutes":5,"set":123}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // `minutes` validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_minutes_too_high() {
+        let u = make_username("residential", 1441, r#"{"k":"v"}"#);
+        assert!(parse_proxy_auth_value(&auth_header(&u)).is_err());
+    }
+
+    #[test]
+    fn test_minutes_float_rejected() {
+        let u = r#"{"meta":{},"minutes":5.5,"set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    #[test]
+    fn test_minutes_string_rejected() {
+        let u = r#"{"meta":{},"minutes":"5","set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // `meta` validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_meta_nested_object_rejected() {
+        let u = make_username("residential", 5, r#"{"a":{"b":1}}"#);
+        let err = parse_proxy_auth_value(&auth_header(&u)).unwrap_err();
+        assert!(err.contains("nested object"), "got: {err}");
+    }
+
+    #[test]
+    fn test_meta_array_rejected() {
+        let u = make_username("residential", 5, r#"{"a":[1,2,3]}"#);
+        let err = parse_proxy_auth_value(&auth_header(&u)).unwrap_err();
+        assert!(err.contains("array"), "got: {err}");
+    }
+
+    #[test]
+    fn test_meta_boolean_rejected() {
+        let u = make_username("residential", 5, r#"{"flag":true}"#);
+        let err = parse_proxy_auth_value(&auth_header(&u)).unwrap_err();
+        assert!(err.contains("boolean"), "got: {err}");
+    }
+
+    #[test]
+    fn test_meta_null_rejected() {
+        let u = make_username("residential", 5, r#"{"key":null}"#);
+        let err = parse_proxy_auth_value(&auth_header(&u)).unwrap_err();
+        assert!(err.contains("null"), "got: {err}");
+    }
+
+    #[test]
+    fn test_meta_not_object_rejected() {
+        let u = r#"{"meta":"notanobject","minutes":5,"set":"residential"}"#;
+        assert!(parse_proxy_auth_value(&auth_header(u)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // percent_decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_percent_decode_plus_slash_equals() {
+        // Base64 chars that get percent-encoded in URLs
+        assert_eq!(percent_decode("abc%2Bdef"), "abc+def");
+        assert_eq!(percent_decode("abc%2Fdef"), "abc/def");
+        assert_eq!(percent_decode("abc%3Ddef"), "abc=def");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode(""), "");
     }
 }
