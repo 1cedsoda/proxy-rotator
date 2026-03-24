@@ -145,32 +145,7 @@ fn pick_least_used<T>(entries: &[Entry<T>]) -> usize {
     }
 }
 
-/// Fast, good-enough random using a thread-local xorshift64.
-fn cheap_random() -> u64 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new({
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            let tid = std::thread::current().id();
-            let tid_bits = format!("{:?}", tid);
-            let tid_hash = tid_bits
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            t ^ tid_hash ^ 0x517cc1b727220a95
-        });
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        x
-    })
-}
+use crate::cheap_random::cheap_random;
 
 // ---------------------------------------------------------------------------
 // Tests

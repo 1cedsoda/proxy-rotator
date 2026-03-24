@@ -2,6 +2,7 @@
 members = [
     "proxy-gateway",
     "proxy-gateway-core",
+    "proxy-gateway-source-bottingtools",
     "proxy-gateway-source-static-file",
 ]
 resolver = "2"
@@ -9,6 +10,7 @@ resolver = "2"
 [workspace.dependencies]
 # Internal crates
 proxy-gateway-core = { path = "proxy-gateway-core" }
+proxy-gateway-source-bottingtools = { path = "proxy-gateway-source-bottingtools" }
 proxy-gateway-source-static-file = { path = "proxy-gateway-source-static-file" }
 
 # Async runtime & networking

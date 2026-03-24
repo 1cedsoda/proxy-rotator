@@ -491,6 +491,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proxy-gateway-core",
+ "proxy-gateway-source-bottingtools",
  "proxy-gateway-source-static-file",
  "serde",
  "serde_json",
@@ -506,8 +507,20 @@ dependencies = [
 name = "proxy-gateway-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "proxy-gateway-source-bottingtools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proxy-gateway-core",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -35,6 +35,8 @@ pub use proxy_gateway_core::{AffinityParams, CountingPool, ProxySource, SourcePr
 pub enum ProxySourceConfig {
     /// Load proxies from a plain-text file at startup.
     StaticFile(proxy_gateway_source_static_file::StaticFileConfig),
+    /// Generate proxies dynamically via bottingtools.
+    Bottingtools(proxy_gateway_source_bottingtools::BottingtoolsConfig),
 }
 
 impl ProxySourceConfig {
@@ -51,8 +53,15 @@ impl ProxySourceConfig {
                     .map_err(|e| anyhow::anyhow!("invalid static_file source config: {e}"))?;
                 Ok(Self::StaticFile(cfg))
             }
+            "bottingtools" => {
+                let cfg: proxy_gateway_source_bottingtools::BottingtoolsConfig = table
+                    .clone()
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("invalid bottingtools source config: {e}"))?;
+                Ok(Self::Bottingtools(cfg))
+            }
             other => anyhow::bail!(
-                "unknown source type '{}'. Supported types: static_file",
+                "unknown source type '{}'. Supported types: static_file, bottingtools",
                 other
             ),
         }
@@ -71,5 +80,6 @@ pub fn build_source(cfg: &ProxySourceConfig, config_dir: &Path) -> Result<Box<dy
         ProxySourceConfig::StaticFile(sc) => {
             proxy_gateway_source_static_file::build_source(sc, config_dir)
         }
+        ProxySourceConfig::Bottingtools(sc) => proxy_gateway_source_bottingtools::build_source(sc),
     }
 }

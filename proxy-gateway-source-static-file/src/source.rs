@@ -24,9 +24,9 @@ impl std::fmt::Debug for StaticFileSource {
 }
 
 impl StaticFileSource {
-    /// Load the source from the given file path.
-    pub fn load(path: &Path) -> Result<Self> {
-        let proxies = load_proxies(path)?;
+    /// Load the source from the given file path using the given format.
+    pub fn load(path: &Path, format: proxy_gateway_core::ProxyFormat) -> Result<Self> {
+        let proxies = load_proxies(path, format)?;
         if proxies.is_empty() {
             anyhow::bail!("no proxies found in {}", path.display());
         }
@@ -68,7 +68,7 @@ pub fn build_source(config: &StaticFileConfig, config_dir: &Path) -> Result<Box<
     } else {
         config.proxies_file.clone()
     };
-    let source = StaticFileSource::load(&path)?;
+    let source = StaticFileSource::load(&path, config.format)?;
     Ok(Box::new(source))
 }
 
@@ -84,7 +84,7 @@ mod tests {
         writeln!(f, "198.51.100.1:6658:user:pass").unwrap();
         f.flush().unwrap();
 
-        let cfg = StaticFileConfig {
+        let cfg = StaticFileConfig { format: proxy_gateway_core::ProxyFormat::default(),
             proxies_file: f.path().to_path_buf(),
         };
         let source = build_source(&cfg, Path::new(".")).unwrap();
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn test_build_source_empty_file_fails() {
         let f = NamedTempFile::new().unwrap();
-        let cfg = StaticFileConfig {
+        let cfg = StaticFileConfig { format: proxy_gateway_core::ProxyFormat::default(),
             proxies_file: f.path().to_path_buf(),
         };
         assert!(build_source(&cfg, Path::new(".")).is_err());
@@ -107,7 +107,7 @@ mod tests {
         writeln!(f, "198.51.100.2:7872:user:pass").unwrap();
         f.flush().unwrap();
 
-        let source = StaticFileSource::load(f.path()).unwrap();
+        let source = StaticFileSource::load(f.path(), proxy_gateway_core::ProxyFormat::HostPortUserPass).unwrap();
         let affinity_params = AffinityParams::new();
         let p = source.get_source_proxy(&affinity_params).unwrap();
         assert!(p.host == "198.51.100.1" || p.host == "198.51.100.2");
