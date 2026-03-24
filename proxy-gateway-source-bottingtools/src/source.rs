@@ -64,13 +64,14 @@ impl BottingtoolsSource {
     }
 }
 
+#[async_trait::async_trait]
 impl ProxySource for BottingtoolsSource {
-    fn get_source_proxy(&self, affinity_params: &AffinityParams) -> Option<SourceProxy> {
+    async fn get_source_proxy(&self, affinity_params: &AffinityParams) -> Option<SourceProxy> {
         let username = build_username(&self.account_user, &self.product, affinity_params);
         Some(self.make_proxy(username))
     }
 
-    fn get_source_proxy_force_rotate(
+    async fn get_source_proxy_force_rotate(
         &self,
         _affinity_params: &AffinityParams,
         current: &SourceProxy,
@@ -152,56 +153,86 @@ mod tests {
         AffinityParams::parse(map).unwrap()
     }
 
-    #[test]
-    fn test_residential_proxy() {
+    #[tokio::test]
+    async fn test_residential_proxy() {
         let source = make_source(residential());
-        let proxy = source.get_source_proxy(&AffinityParams::new()).unwrap();
+        let proxy = source
+            .get_source_proxy(&AffinityParams::new())
+            .await
+            .unwrap();
         assert_eq!(proxy.host, "proxy.bottingtools.com");
         assert_eq!(proxy.port, 1337);
         assert_eq!(proxy.password.as_deref(), Some("XpmTeTdYy8hT"));
-        assert!(proxy.username.unwrap().starts_with("exampleuser_pool-custom_type-high_"));
+        assert!(proxy
+            .username
+            .unwrap()
+            .starts_with("exampleuser_pool-custom_type-high_"));
     }
 
-    #[test]
-    fn test_isp_proxy() {
+    #[tokio::test]
+    async fn test_isp_proxy() {
         let source = make_source(isp());
-        let proxy = source.get_source_proxy(&AffinityParams::new()).unwrap();
+        let proxy = source
+            .get_source_proxy(&AffinityParams::new())
+            .await
+            .unwrap();
         assert!(proxy.username.unwrap().contains("_pool-isp_"));
     }
 
-    #[test]
-    fn test_datacenter_proxy() {
+    #[tokio::test]
+    async fn test_datacenter_proxy() {
         let source = make_source(ProductConfig::Datacenter(DatacenterConfig {
             countries: vec![crate::location::Country::DE],
         }));
-        let proxy = source.get_source_proxy(&AffinityParams::new()).unwrap();
-        assert_eq!(proxy.username.as_deref(), Some("exampleuser_pool-dc_country-de"));
+        let proxy = source
+            .get_source_proxy(&AffinityParams::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            proxy.username.as_deref(),
+            Some("exampleuser_pool-dc_country-de")
+        );
     }
 
-    #[test]
-    fn test_each_call_has_different_session() {
+    #[tokio::test]
+    async fn test_each_call_has_different_session() {
         let source = make_source(residential());
-        let p1 = source.get_source_proxy(&AffinityParams::new()).unwrap();
-        let p2 = source.get_source_proxy(&AffinityParams::new()).unwrap();
+        let p1 = source
+            .get_source_proxy(&AffinityParams::new())
+            .await
+            .unwrap();
+        let p2 = source
+            .get_source_proxy(&AffinityParams::new())
+            .await
+            .unwrap();
         assert_ne!(p1.username, p2.username);
     }
 
-    #[test]
-    fn test_force_rotate_changes_only_session_id() {
+    #[tokio::test]
+    async fn test_force_rotate_changes_only_session_id() {
         let source = make_source(ProductConfig::Residential(ResidentialConfig {
             quality: ResidentialQuality::High,
             countries: vec![crate::location::Country::US],
             city: None,
         }));
         let ap = params(&[("sesstime", "10")]);
-        let original = source.get_source_proxy(&ap).unwrap();
-        let rotated = source.get_source_proxy_force_rotate(&ap, &original).unwrap();
+        let original = source.get_source_proxy(&ap).await.unwrap();
+        let rotated = source
+            .get_source_proxy_force_rotate(&ap, &original)
+            .await
+            .unwrap();
         let orig_user = original.username.unwrap();
         let rot_user = rotated.username.unwrap();
         assert!(rot_user.contains("_country-US_"));
         assert!(rot_user.contains("_sesstime-10"));
-        let orig_sess = orig_user.split('_').find(|s| s.starts_with("session-")).unwrap();
-        let rot_sess = rot_user.split('_').find(|s| s.starts_with("session-")).unwrap();
+        let orig_sess = orig_user
+            .split('_')
+            .find(|s| s.starts_with("session-"))
+            .unwrap();
+        let rot_sess = rot_user
+            .split('_')
+            .find(|s| s.starts_with("session-"))
+            .unwrap();
         assert_ne!(orig_sess, rot_sess);
     }
 

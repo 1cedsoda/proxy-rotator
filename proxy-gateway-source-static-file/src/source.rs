@@ -38,12 +38,13 @@ impl StaticFileSource {
     }
 }
 
+#[async_trait::async_trait]
 impl ProxySource for StaticFileSource {
-    fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
+    async fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
         self.pool.next().cloned()
     }
 
-    fn get_source_proxy_force_rotate(
+    async fn get_source_proxy_force_rotate(
         &self,
         _affinity_params: &AffinityParams,
         current: &SourceProxy,
@@ -84,7 +85,8 @@ mod tests {
         writeln!(f, "198.51.100.1:6658:user:pass").unwrap();
         f.flush().unwrap();
 
-        let cfg = StaticFileConfig { format: proxy_gateway_core::ProxyFormat::default(),
+        let cfg = StaticFileConfig {
+            format: proxy_gateway_core::ProxyFormat::default(),
             proxies_file: f.path().to_path_buf(),
         };
         let source = build_source(&cfg, Path::new(".")).unwrap();
@@ -94,22 +96,27 @@ mod tests {
     #[test]
     fn test_build_source_empty_file_fails() {
         let f = NamedTempFile::new().unwrap();
-        let cfg = StaticFileConfig { format: proxy_gateway_core::ProxyFormat::default(),
+        let cfg = StaticFileConfig {
+            format: proxy_gateway_core::ProxyFormat::default(),
             proxies_file: f.path().to_path_buf(),
         };
         assert!(build_source(&cfg, Path::new(".")).is_err());
     }
 
-    #[test]
-    fn test_get_source_proxy_returns_proxy() {
+    #[tokio::test]
+    async fn test_get_source_proxy_returns_proxy() {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "198.51.100.1:6658:user:pass").unwrap();
         writeln!(f, "198.51.100.2:7872:user:pass").unwrap();
         f.flush().unwrap();
 
-        let source = StaticFileSource::load(f.path(), proxy_gateway_core::ProxyFormat::HostPortUserPass).unwrap();
+        let source = StaticFileSource::load(
+            f.path(),
+            proxy_gateway_core::ProxyFormat::HostPortUserPass,
+        )
+        .unwrap();
         let affinity_params = AffinityParams::new();
-        let p = source.get_source_proxy(&affinity_params).unwrap();
+        let p = source.get_source_proxy(&affinity_params).await.unwrap();
         assert!(p.host == "198.51.100.1" || p.host == "198.51.100.2");
     }
 }

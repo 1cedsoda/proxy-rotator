@@ -30,19 +30,10 @@ impl GeonodeSource {
     }
 }
 
+#[async_trait::async_trait]
 impl ProxySource for GeonodeSource {
-    fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
-        // ProxySource is sync; block on the async API call.
-        let proxies = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(fetch_proxies(&self.client, &self.config, &self.password))
-            }),
-            Err(_) => tokio::runtime::Runtime::new()
-                .expect("failed to create tokio runtime")
-                .block_on(fetch_proxies(&self.client, &self.config, &self.password)),
-        };
-
-        let proxies = match proxies {
+    async fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
+        let proxies = match fetch_proxies(&self.client, &self.config, &self.password).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("geonode API call failed: {e:#}");

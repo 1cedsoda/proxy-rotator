@@ -304,12 +304,15 @@ async fn handle_request_inner(
         }
     };
 
-    let upstream = match rotator.next_proxy(
-        &auth.set_name,
-        auth.affinity_minutes,
-        &auth.username_b64,
-        auth.affinity_params,
-    ) {
+    let upstream = match rotator
+        .next_proxy(
+            &auth.set_name,
+            auth.affinity_minutes,
+            &auth.username_b64,
+            auth.affinity_params,
+        )
+        .await
+    {
         Some(p) => p,
         None => {
             warn!(
@@ -499,7 +502,7 @@ async fn handle_api_request(
         // POST .../rotate — force-rotate the session's upstream proxy
         if req.method() == Method::POST && username_b64.ends_with("/rotate") {
             let key = username_b64.trim_end_matches("/rotate");
-            return api::force_rotate(rotator, key);
+            return api::force_rotate(rotator, key).await;
         }
         api::get_session(rotator, &username_b64)
     } else if let Some(raw) = path.strip_prefix("/api/verify/") {

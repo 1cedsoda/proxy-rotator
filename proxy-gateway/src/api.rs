@@ -93,14 +93,17 @@ pub fn get_session(rotator: &Rotator, username: &str) -> Response<BoxBody<Bytes,
         ("bearer" = [])
     )
 )]
-pub fn force_rotate(rotator: &Rotator, username: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
+pub async fn force_rotate(
+    rotator: &Rotator,
+    username: &str,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
     if username.is_empty() {
         return json_response(
             StatusCode::BAD_REQUEST,
             r#"{"error":"Username is required"}"#,
         );
     }
-    match rotator.force_rotate(username) {
+    match rotator.force_rotate(username).await {
         Some(info) => {
             let json = serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string());
             json_response(StatusCode::OK, &json)
@@ -157,7 +160,7 @@ pub async fn verify_username(
     };
 
     // 2. Check the proxy set exists and pick a proxy without creating a session.
-    let upstream = match rotator.pick_any(&auth.set_name) {
+    let upstream = match rotator.pick_any(&auth.set_name).await {
         Some(p) => p,
         None => {
             let result = VerifyResult {

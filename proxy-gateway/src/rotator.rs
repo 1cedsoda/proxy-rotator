@@ -166,7 +166,7 @@ impl Rotator {
     /// `affinity_minutes` controls sticky session duration (0 = no affinity).
     /// `meta_b64` is the raw base64 segment used as the affinity map key.
     /// `affinity_params` is the decoded, validated JSON fields stored in the session entry.
-    pub fn next_proxy(
+    pub async fn next_proxy(
         &self,
         set_name: &str,
         affinity_minutes: u16,
@@ -174,12 +174,14 @@ impl Rotator {
         affinity_params: AffinityParams,
     ) -> Option<ResolvedProxy> {
         let set = self.sets.iter().find(|s| s.name == set_name)?;
-        let proxy = set.pick(
-            affinity_minutes,
-            meta_b64,
-            affinity_params,
-            &self.next_session_id,
-        )?;
+        let proxy = set
+            .pick(
+                affinity_minutes,
+                meta_b64,
+                affinity_params,
+                &self.next_session_id,
+            )
+            .await?;
         Some(ResolvedProxy {
             host: proxy.host.clone(),
             port: proxy.port,
@@ -196,43 +198,56 @@ impl Rotator {
     ///
     /// Returns the updated [`SessionInfo`], or `None` if no active session
     /// exists for the given username.
-    pub fn force_rotate(&self, username: &str) -> Option<SessionInfo> {
+    pub async fn force_rotate(&self, username: &str) -> Option<SessionInfo> {
         for set in &self.sets {
-            if let Some(mut entry) = set.affinity_map.get_mut(username) {
+            // Read phase: extract what we need and drop the guard before awaiting.
+            let (affinity_params, current_proxy, duration, session_id, created_at) = {
+                let entry = set.affinity_map.get(username)?;
                 if entry.started_at.elapsed() >= entry.duration {
                     return None; // expired — treat as not found
                 }
+                (
+                    entry.affinity_params.clone(),
+                    entry.proxy.clone(),
+                    entry.duration,
+                    entry.session_id,
+                    entry.created_at.clone(),
+                )
+            }; // guard dropped here
 
-                let new_proxy = set
-                    .source
-                    .get_source_proxy_force_rotate(&entry.affinity_params, &entry.proxy)?;
+            let new_proxy = set
+                .source
+                .get_source_proxy_force_rotate(&affinity_params, &current_proxy)
+                .await?;
 
+            // Write phase: re-acquire the entry to update it.
+            let info = {
+                let mut entry = set.affinity_map.get_mut(username)?;
                 let now = SystemTime::now();
                 entry.last_rotation_at = now;
-                entry.next_rotation_at = now + entry.duration;
+                entry.next_rotation_at = now + duration;
                 entry.proxy = new_proxy;
-
-                return Some(SessionInfo {
-                    session_id: entry.session_id,
+                SessionInfo {
+                    session_id,
                     username: username.to_string(),
                     proxy_set: set.name.clone(),
                     upstream: format!("{}:{}", entry.proxy.host, entry.proxy.port),
-                    created_at: entry.created_at.clone(),
+                    created_at,
                     next_rotation_at: format_system_time(entry.next_rotation_at),
                     last_rotation_at: format_system_time(entry.last_rotation_at),
                     affinity_params: entry.affinity_params.clone(),
-                });
-            }
+                }
+            };
+            return Some(info);
         }
         None
     }
 
     /// Pick a proxy from a named set without creating an affinity entry.
     /// Used for pre-flight verification checks.
-    pub fn pick_any(&self, set_name: &str) -> Option<ResolvedProxy> {
+    pub async fn pick_any(&self, set_name: &str) -> Option<ResolvedProxy> {
         let set = self.sets.iter().find(|s| s.name == set_name)?;
-        let empty = AffinityParams::new();
-        let proxy = set.source.get_source_proxy(&empty)?;
+        let proxy = set.source.get_source_proxy(&AffinityParams::new()).await?;
         Some(ResolvedProxy {
             host: proxy.host.clone(),
             port: proxy.port,
@@ -314,7 +329,7 @@ impl RotatorSet {
     /// is allocated from `id_counter` only when a fresh entry is created.
     ///
     /// Returns `None` only if the underlying source cannot provide an endpoint.
-    fn pick(
+    async fn pick(
         &self,
         affinity_minutes: u16,
         username_b64: &str,
@@ -323,7 +338,7 @@ impl RotatorSet {
     ) -> Option<SourceProxy> {
         if affinity_minutes == 0 {
             // No affinity — delegate directly to the source.
-            return self.source.get_source_proxy(&affinity_params);
+            return self.source.get_source_proxy(&affinity_params).await;
         }
 
         let duration = Duration::from_secs(affinity_minutes as u64 * 60);
@@ -336,7 +351,7 @@ impl RotatorSet {
         }
 
         // No valid entry — ask the source for a new endpoint.
-        let proxy = self.source.get_source_proxy(&affinity_params)?;
+        let proxy = self.source.get_source_proxy(&affinity_params).await?;
 
         let session_id = id_counter.fetch_add(1, Ordering::Relaxed);
         let now_wall = SystemTime::now();
@@ -467,8 +482,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ProxySource for VecSource {
-        fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
+        async fn get_source_proxy(&self, _affinity_params: &AffinityParams) -> Option<SourceProxy> {
             self.pool.next().cloned()
         }
 
@@ -494,8 +510,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_least_used_distributes_evenly() {
+    #[tokio::test]
+    async fn test_least_used_distributes_evenly() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 0, &[("k", "v")]);
 
@@ -503,6 +519,7 @@ mod tests {
         for _ in 0..400 {
             let p = rotator
                 .next_proxy("test", 0, &b64, empty_affinity_params())
+                .await
                 .unwrap();
             *counts.entry(p.host.clone()).or_default() += 1;
         }
@@ -513,28 +530,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_credentials_from_proxy_entry() {
+    #[tokio::test]
+    async fn test_credentials_from_proxy_entry() {
         let rotator = Rotator::new(vec![make_test_set(1)]);
         let b64 = make_username_b64("test", 0, &[("k", "v")]);
         let p = rotator
             .next_proxy("test", 0, &b64, empty_affinity_params())
+            .await
             .unwrap();
         assert_eq!(p.username.as_deref(), Some("testuser"));
         assert_eq!(p.password.as_deref(), Some("testpass"));
     }
 
-    #[test]
-    fn test_session_affinity_with_minutes() {
+    #[tokio::test]
+    async fn test_session_affinity_with_minutes() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 5, &[("session", "mysession")]);
 
         let first = rotator
             .next_proxy("test", 5, &b64, empty_affinity_params())
+            .await
             .unwrap();
         for _ in 0..10 {
             let subsequent = rotator
                 .next_proxy("test", 5, &b64, empty_affinity_params())
+                .await
                 .unwrap();
             assert_eq!(
                 first.host, subsequent.host,
@@ -543,8 +563,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_zero_minutes_no_affinity() {
+    #[tokio::test]
+    async fn test_zero_minutes_no_affinity() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 0, &[("k", "v")]);
 
@@ -552,55 +572,60 @@ mod tests {
         for _ in 0..100 {
             let p = rotator
                 .next_proxy("test", 0, &b64, empty_affinity_params())
+                .await
                 .unwrap();
             hosts.insert(p.host);
         }
-        // With 0 minutes there is no pinning — all 4 proxies should be used.
         assert!(hosts.len() > 1, "Should distribute without affinity");
     }
 
-    #[test]
-    fn test_different_session_keys_independent_affinity() {
+    #[tokio::test]
+    async fn test_different_session_keys_independent_affinity() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64_a = make_username_b64("test", 60, &[("session", "sessA")]);
         let b64_b = make_username_b64("test", 60, &[("session", "sessB")]);
 
         let pa = rotator
             .next_proxy("test", 60, &b64_a, empty_affinity_params())
+            .await
             .unwrap();
         let pb = rotator
             .next_proxy("test", 60, &b64_b, empty_affinity_params())
+            .await
             .unwrap();
 
-        // Both sessions should remain stable.
         for _ in 0..5 {
             let pa2 = rotator
                 .next_proxy("test", 60, &b64_a, empty_affinity_params())
+                .await
                 .unwrap();
             let pb2 = rotator
                 .next_proxy("test", 60, &b64_b, empty_affinity_params())
+                .await
                 .unwrap();
             assert_eq!(pa.host, pa2.host);
             assert_eq!(pb.host, pb2.host);
         }
     }
 
-    #[test]
-    fn test_unknown_set_returns_none() {
+    #[tokio::test]
+    async fn test_unknown_set_returns_none() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("unknown", 0, &[]);
         assert!(rotator
             .next_proxy("unknown", 0, &b64, empty_affinity_params())
+            .await
             .is_none());
     }
 
-    #[test]
-    fn test_get_session_active() {
+    #[tokio::test]
+    async fn test_get_session_active() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 5, &[("session", "mysess")]);
 
         let p = rotator
             .next_proxy("test", 5, &b64, empty_affinity_params())
+            .await
             .unwrap();
 
         let info = rotator.get_session(&b64).unwrap();
@@ -611,13 +636,14 @@ mod tests {
         assert!(!info.next_rotation_at.is_empty());
     }
 
-    #[test]
-    fn test_get_session_no_affinity_returns_none() {
+    #[tokio::test]
+    async fn test_get_session_no_affinity_returns_none() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 0, &[("session", "nosess")]);
 
         rotator
             .next_proxy("test", 0, &b64, empty_affinity_params())
+            .await
             .unwrap();
         assert!(rotator.get_session(&b64).is_none());
     }
@@ -629,8 +655,8 @@ mod tests {
         assert!(rotator.get_session("").is_none());
     }
 
-    #[test]
-    fn test_list_sessions() {
+    #[tokio::test]
+    async fn test_list_sessions() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64_a = make_username_b64("test", 5, &[("session", "sessA")]);
         let b64_b = make_username_b64("test", 10, &[("session", "sessB")]);
@@ -638,13 +664,16 @@ mod tests {
 
         rotator
             .next_proxy("test", 5, &b64_a, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 10, &b64_b, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 0, &b64_noaff, empty_affinity_params())
-            .unwrap(); // won't appear
+            .await
+            .unwrap();
 
         let sessions = rotator.list_sessions();
         assert_eq!(sessions.len(), 2);
@@ -654,8 +683,8 @@ mod tests {
         assert!(usernames.contains(&b64_b.as_str()));
     }
 
-    #[test]
-    fn test_session_ids_are_unique() {
+    #[tokio::test]
+    async fn test_session_ids_are_unique() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64_a = make_username_b64("test", 5, &[("session", "a")]);
         let b64_b = make_username_b64("test", 5, &[("session", "b")]);
@@ -663,12 +692,15 @@ mod tests {
 
         rotator
             .next_proxy("test", 5, &b64_a, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 5, &b64_b, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 5, &b64_c, empty_affinity_params())
+            .await
             .unwrap();
 
         let mut sessions = rotator.list_sessions();
@@ -681,8 +713,8 @@ mod tests {
         assert_eq!(ids.len(), deduped.len(), "Session IDs must be unique");
     }
 
-    #[test]
-    fn test_session_id_increments() {
+    #[tokio::test]
+    async fn test_session_id_increments() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64_a = make_username_b64("test", 5, &[("session", "a")]);
         let b64_b = make_username_b64("test", 5, &[("session", "b")]);
@@ -690,12 +722,15 @@ mod tests {
 
         rotator
             .next_proxy("test", 5, &b64_a, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 5, &b64_b, empty_affinity_params())
+            .await
             .unwrap();
         rotator
             .next_proxy("test", 5, &b64_c, empty_affinity_params())
+            .await
             .unwrap();
 
         let mut sessions = rotator.list_sessions();
@@ -706,18 +741,19 @@ mod tests {
         assert_eq!(sessions[2].session_id, 2);
     }
 
-    #[test]
-    fn test_force_rotate_changes_upstream() {
+    #[tokio::test]
+    async fn test_force_rotate_changes_upstream() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 60, &[("session", "rot")]);
 
         let original = rotator
             .next_proxy("test", 60, &b64, empty_affinity_params())
+            .await
             .unwrap();
 
         let mut rotated_upstream = original.host.clone();
         for _ in 0..20 {
-            let info = rotator.force_rotate(&b64).unwrap();
+            let info = rotator.force_rotate(&b64).await.unwrap();
             rotated_upstream = info.upstream.split(':').next().unwrap().to_string();
             if rotated_upstream != original.host {
                 break;
@@ -729,17 +765,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_force_rotate_preserves_session_id_and_metadata() {
+    #[tokio::test]
+    async fn test_force_rotate_preserves_session_id_and_metadata() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 60, &[("session", "preserve")]);
 
         rotator
             .next_proxy("test", 60, &b64, empty_affinity_params())
+            .await
             .unwrap();
         let before = rotator.get_session(&b64).unwrap();
 
-        rotator.force_rotate(&b64).unwrap();
+        rotator.force_rotate(&b64).await.unwrap();
         let after = rotator.get_session(&b64).unwrap();
 
         assert_eq!(
@@ -750,19 +787,20 @@ mod tests {
         assert_eq!(before.username, after.username);
     }
 
-    #[test]
-    fn test_force_rotate_resets_ttl() {
+    #[tokio::test]
+    async fn test_force_rotate_resets_ttl() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
         let b64 = make_username_b64("test", 60, &[("session", "ttl")]);
 
         rotator
             .next_proxy("test", 60, &b64, empty_affinity_params())
+            .await
             .unwrap();
         let before = rotator.get_session(&b64).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        rotator.force_rotate(&b64).unwrap();
+        rotator.force_rotate(&b64).await.unwrap();
         let after = rotator.get_session(&b64).unwrap();
 
         assert!(
@@ -771,10 +809,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_force_rotate_unknown_returns_none() {
+    #[tokio::test]
+    async fn test_force_rotate_unknown_returns_none() {
         let rotator = Rotator::new(vec![make_test_set(4)]);
-        assert!(rotator.force_rotate("nosuchkey").is_none());
+        assert!(rotator.force_rotate("nosuchkey").await.is_none());
     }
 
     #[test]
