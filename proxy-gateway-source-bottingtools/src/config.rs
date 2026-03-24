@@ -15,7 +15,6 @@ use crate::location::Country;
 /// username = "exampleuser"
 /// password_env = "BOTTINGTOOLS_PASSWORD"
 /// host = "proxy.bottingtools.com"
-/// port = 1337
 ///
 /// [proxy_set.source.product]
 /// type = "residential"
@@ -47,9 +46,6 @@ pub struct BottingtoolsConfig {
 
     /// Proxy server hostname (e.g. `"proxy.bottingtools.com"`).
     pub host: String,
-
-    /// Proxy server port (e.g. `1337`).
-    pub port: u16,
 
     /// Product-specific configuration.
     pub product: ProductConfig,

@@ -15,7 +15,6 @@ pub struct BottingtoolsSource {
     account_user: String,
     password: String,
     host: String,
-    port: u16,
     product: ProductConfig,
 }
 
@@ -25,7 +24,6 @@ impl std::fmt::Debug for BottingtoolsSource {
             .field("account_user", &self.account_user)
             .field("product", &self.product)
             .field("host", &self.host)
-            .field("port", &self.port)
             .finish()
     }
 }
@@ -49,7 +47,6 @@ impl BottingtoolsSource {
             account_user: config.username.clone(),
             password,
             host: config.host.clone(),
-            port: config.port,
             product: config.product.clone(),
         })
     }
@@ -57,7 +54,7 @@ impl BottingtoolsSource {
     fn make_proxy(&self, username: String) -> SourceProxy {
         SourceProxy {
             host: self.host.clone(),
-            port: self.port,
+            port: 1337,
             username: Some(username),
             password: Some(self.password.clone()),
         }
@@ -96,10 +93,7 @@ impl ProxySource for BottingtoolsSource {
             ProductConfig::Isp(_) => "isp".to_string(),
             ProductConfig::Datacenter(_) => "datacenter".to_string(),
         };
-        format!(
-            "bottingtools {} {}@{}:{}",
-            product, self.account_user, self.host, self.port
-        )
+        format!("bottingtools {} {}@{}", product, self.account_user, self.host)
     }
 }
 
@@ -123,7 +117,6 @@ mod tests {
             username: "exampleuser".to_string(),
             password_env: "TEST_BT_PASS".to_string(),
             host: "proxy.bottingtools.com".to_string(),
-            port: 1337,
             product,
         })
         .unwrap()
@@ -161,7 +154,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(proxy.host, "proxy.bottingtools.com");
-        assert_eq!(proxy.port, 1337);
         assert_eq!(proxy.password.as_deref(), Some("XpmTeTdYy8hT"));
         assert!(proxy
             .username
@@ -241,7 +233,7 @@ mod tests {
         let source = make_source(residential());
         assert_eq!(
             source.describe(),
-            "bottingtools residential(high) exampleuser@proxy.bottingtools.com:1337"
+            "bottingtools residential(high) exampleuser@proxy.bottingtools.com"
         );
     }
 
@@ -250,7 +242,7 @@ mod tests {
         let source = make_source(isp());
         assert_eq!(
             source.describe(),
-            "bottingtools isp exampleuser@proxy.bottingtools.com:1337"
+            "bottingtools isp exampleuser@proxy.bottingtools.com"
         );
     }
 
@@ -259,7 +251,7 @@ mod tests {
         let source = make_source(datacenter());
         assert_eq!(
             source.describe(),
-            "bottingtools datacenter exampleuser@proxy.bottingtools.com:1337"
+            "bottingtools datacenter exampleuser@proxy.bottingtools.com"
         );
     }
 
@@ -270,7 +262,6 @@ mod tests {
             username: "exampleuser".to_string(),
             password_env: "TEST_BT_PASS".to_string(),
             host: "proxy.bottingtools.com".to_string(),
-            port: 1337,
             product: ProductConfig::Residential(ResidentialConfig {
                 quality: ResidentialQuality::High,
                 countries: vec![crate::location::Country::NL],
@@ -287,7 +278,6 @@ mod tests {
             username: "exampleuser".to_string(),
             password_env: "TEST_BT_PASS".to_string(),
             host: "proxy.bottingtools.com".to_string(),
-            port: 1337,
             product: ProductConfig::Residential(ResidentialConfig {
                 quality: ResidentialQuality::High,
                 countries: vec![crate::location::Country::NL, crate::location::Country::DE],
@@ -304,7 +294,6 @@ mod tests {
             username: "exampleuser".to_string(),
             password_env: "TEST_BT_PASS".to_string(),
             host: "proxy.bottingtools.com".to_string(),
-            port: 1337,
             product: ProductConfig::Residential(ResidentialConfig {
                 quality: ResidentialQuality::High,
                 countries: vec![],
@@ -321,7 +310,6 @@ mod tests {
             username: "user".to_string(),
             password_env: "NONEXISTENT_VAR_FOR_TEST".to_string(),
             host: "host.com".to_string(),
-            port: 1337,
             product: residential(),
         };
         assert!(BottingtoolsSource::from_config(&config).is_err());
