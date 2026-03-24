@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://npm.pkg.github.com"
-          scope: "@1cedsoda"
+          scope: "@traumwohnung"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4

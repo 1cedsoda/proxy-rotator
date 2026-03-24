@@ -1,5 +1,5 @@
 {
-    "name": "@1cedsoda/proxy-gateway-client",
+    "name": "@traumwohnung/proxy-gateway-client",
     "version": "0.8.1",
     "type": "module",
     "exports": {

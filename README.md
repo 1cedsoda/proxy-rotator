@@ -2,8 +2,8 @@
 
 A Rust HTTP proxy server that load-balances requests across pools of upstream proxies with least-used rotation, per-request session affinity, and a REST API for session inspection.
 
-Pre-built Docker images: `ghcr.io/1cedsoda/proxy-gateway`  
-TypeScript client: [`@1cedsoda/proxy-gateway-client`](https://github.com/1cedsoda/proxy-gateway/pkgs/npm/proxy-gateway-client)
+Pre-built Docker images: `ghcr.io/traumwohnung/proxy-gateway`  
+TypeScript client: [`@traumwohnung/proxy-gateway-client`](https://github.com/traumwohnung/proxy-gateway/pkgs/npm/proxy-gateway-client)
 
 ## Repository layout
 
@@ -11,7 +11,7 @@ TypeScript client: [`@1cedsoda/proxy-gateway-client`](https://github.com/1cedsod
 proxy-gateway-core/                 # Shared types & traits (SourceProxy, ProxySource, AffinityParams, CountingPool)
 proxy-gateway-source-static-file/   # Static-file source — loads proxies from a text file
 proxy-gateway/                      # The proxy server binary (wires everything together)
-proxy-gateway-client/               # TypeScript/Node client package (@1cedsoda/proxy-gateway-client)
+proxy-gateway-client/               # TypeScript/Node client package (@traumwohnung/proxy-gateway-client)
 ```
 
 ## Architecture
@@ -188,18 +188,18 @@ cargo run --bin gen-openapi --manifest-path proxy-gateway/Cargo.toml
 
 ## TypeScript client
 
-`@1cedsoda/proxy-gateway-client` is published to GitHub Packages.
+`@traumwohnung/proxy-gateway-client` is published to GitHub Packages.
 
 ### Installation
 
 Add to `.npmrc`:
 ```
-@1cedsoda:registry=https://npm.pkg.github.com
+@traumwohnung:registry=https://npm.pkg.github.com
 //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
 ```
 
 ```bash
-npm install @1cedsoda/proxy-gateway-client
+npm install @traumwohnung/proxy-gateway-client
 ```
 
 ### API
@@ -215,7 +215,7 @@ npm install @1cedsoda/proxy-gateway-client
 ### Usage
 
 ```ts
-import { configureProxy, buildAndVerifyProxyUsername } from "@1cedsoda/proxy-gateway-client";
+import { configureProxy, buildAndVerifyProxyUsername } from "@traumwohnung/proxy-gateway-client";
 
 // Call once at startup
 configureProxy({ proxyUrl: "http://proxy-gateway:8100", apiKey: "mysecretkey" });
@@ -284,7 +284,7 @@ docker run -p 8100:8100 \
   -e API_KEY=mysecretkey \
   -v ./config.toml:/data/config/config.toml:ro \
   -v ./proxies:/data/config/proxies:ro \
-  ghcr.io/1cedsoda/proxy-gateway:0.7.0
+  ghcr.io/traumwohnung/proxy-gateway:0.7.0
 ```
 
 See [`deployment/`](deployment/) for docker-compose examples.

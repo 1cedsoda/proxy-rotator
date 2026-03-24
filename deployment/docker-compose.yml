@@ -1,6 +1,6 @@
 services:
   proxy-gateway:
-    image: ghcr.io/1cedsoda/proxy-gateway:main
+    image: ghcr.io/traumwohnung/proxy-gateway:main
     # Or build locally:
     # build:
     #   context: ..
