@@ -12,9 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"proxy-gateway/core"
-	bottingtools "proxy-gateway/source-bottingtools"
-	geonode "proxy-gateway/source-geonode"
-	staticfile "proxy-gateway/source-static-file"
+	"proxy-gateway/utils"
 )
 
 type Config struct {
@@ -53,13 +51,11 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // BuildPipeline constructs the full handler pipeline from config.
-// Returns the pipeline, the sticky session handler (for API introspection), and any error.
 func BuildPipeline(cfg *Config, configDir string) (core.Handler, *core.StickyHandler, error) {
 	if cfg.AuthSub == "" || cfg.AuthPassword == "" {
 		return nil, nil, fmt.Errorf("auth_sub and auth_password are required")
 	}
 
-	// Build a handler that routes by set name to the right source.
 	sources := make(map[string]core.Handler)
 	for _, raw := range cfg.ProxySets {
 		src, err := buildSource(raw.SourceType, raw.Source, configDir)
@@ -80,7 +76,6 @@ func BuildPipeline(cfg *Config, configDir string) (core.Handler, *core.StickyHan
 
 	sticky := core.Sticky(router)
 
-	// Pipeline: parse JSON credentials → authenticate → sticky sessions → route to source
 	pipeline := ParseJSONCreds(
 		core.Auth(
 			NewSimpleAuth(cfg.AuthSub, cfg.AuthPassword),
@@ -99,42 +94,42 @@ func buildSource(sourceType string, rawSource map[string]interface{}, configDir 
 
 	switch sourceType {
 	case "static_file":
-		var cfg staticfile.Config
+		var cfg utils.StaticFileConfig
 		cfg.Format = core.DefaultProxyFormat
 		if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
 			return nil, fmt.Errorf("invalid static_file config: %w", err)
 		}
-		return staticfile.BuildSource(&cfg, configDir)
+		return utils.NewStaticFileSource(&cfg, configDir)
 
 	case "bottingtools":
 		var rawCfg struct {
-			Username    string                        `json:"username"`
-			PasswordEnv string                        `json:"password_env"`
-			Host        string                        `json:"host"`
-			Product     bottingtools.RawProductConfig `json:"product"`
+			Username    string                             `json:"username"`
+			PasswordEnv string                             `json:"password_env"`
+			Host        string                             `json:"host"`
+			Product     utils.BottingtoolsRawProductConfig `json:"product"`
 		}
 		if err := json.Unmarshal(jsonBytes, &rawCfg); err != nil {
 			return nil, fmt.Errorf("invalid bottingtools config: %w", err)
 		}
-		product, err := bottingtools.ParseProductConfig(rawCfg.Product)
+		product, err := utils.ParseBottingtoolsProductConfig(rawCfg.Product)
 		if err != nil {
 			return nil, err
 		}
-		return bottingtools.BuildSource(&bottingtools.Config{
+		return utils.NewBottingtoolsSource(&utils.BottingtoolsConfig{
 			Username: rawCfg.Username, PasswordEnv: rawCfg.PasswordEnv,
 			Host: rawCfg.Host, Product: product,
 		})
 
 	case "geonode":
-		var cfg geonode.Config
-		cfg.Protocol = geonode.GeonodeProtocolHTTP
+		var cfg utils.GeonodeConfig
+		cfg.Protocol = utils.GeonodeProtocolHTTP
 		if err := json.Unmarshal(jsonBytes, &cfg); err != nil {
 			return nil, fmt.Errorf("invalid geonode config: %w", err)
 		}
 		if cfg.Session.Type == "" {
-			cfg.Session.Type = geonode.SessionTypeRotating
+			cfg.Session.Type = utils.GeonodeSessionRotating
 		}
-		return geonode.BuildSource(&cfg)
+		return utils.NewGeonodeSource(&cfg)
 
 	default:
 		return nil, fmt.Errorf("unknown source type %q", sourceType)
