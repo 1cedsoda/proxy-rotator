@@ -13,6 +13,7 @@ import (
 	chiware "github.com/go-chi/chi/v5/middleware"
 
 	"proxy-gateway/core"
+	"proxy-gateway/utils"
 )
 
 // RunServer starts the proxy and, optionally, the admin API and SOCKS5 listener.
@@ -46,17 +47,12 @@ func RunServer(cfg *Config, srv *Server, apiKey string) error {
 	}
 
 	// --- HTTP proxy (main listener) ---
-	// The proxy handler is registered as middleware so it catches everything
-	// that doesn't match an explicit route — no brittle /* catch-all.
 	r := chi.NewRouter()
 	r.Use(chiware.Recoverer)
-	// Mount the proxy handler as chi middleware so it catches all requests
-	// that don't match an explicit route — no fragile /* catch-all needed.
 	proxyHandler := core.HTTPProxyHandler(srv.Pipeline)
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			proxyHandler.ServeHTTP(w, r)
-			// proxy handler fully handles the request; next is not called
 		})
 	})
 
@@ -79,13 +75,13 @@ func RunServer(cfg *Config, srv *Server, apiKey string) error {
 }
 
 // buildAdminServer constructs the management REST API on a dedicated listener.
-func buildAdminServer(addr string, sessions *core.SessionHandler, apiKey string) *http.Server {
+func buildAdminServer(addr string, sessions *utils.SessionManager, apiKey string) *http.Server {
 	r := chi.NewRouter()
 	r.Use(chiware.Recoverer)
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/sessions", bearerAuth(apiKey, handleListSessions(sessions)))
-		r.Get("/sessions/{key}", bearerAuth(apiKey, handleGetSession(sessions)))
-		r.Post("/sessions/{key}/rotate", bearerAuth(apiKey, handleForceRotate(sessions)))
+		r.Get("/sessions/{username}", bearerAuth(apiKey, handleGetSession(sessions)))
+		r.Post("/sessions/{username}/rotate", bearerAuth(apiKey, handleForceRotate(sessions)))
 	})
 	return &http.Server{Addr: addr, Handler: r}
 }

@@ -7,7 +7,6 @@ import (
 )
 
 func main() {
-	// Init logging from environment first so any early errors are structured.
 	initLogging(os.Getenv("LOG_LEVEL"))
 
 	configPath := "config.toml"
@@ -21,7 +20,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Re-init logging with level from config (overrides env).
 	if cfg.LogLevel != "" {
 		initLogging(cfg.LogLevel)
 	}
@@ -31,7 +29,7 @@ func main() {
 		configDir = "."
 	}
 
-	srv, err := BuildServer(cfg, configDir)
+	srv, err := BuildServer(cfg, configDir, os.Getenv("PROXY_PASSWORD"))
 	if err != nil {
 		slog.Error("failed to build server", "err", err)
 		os.Exit(1)

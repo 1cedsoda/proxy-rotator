@@ -59,8 +59,11 @@ func NewStaticFileSource(cfg *StaticFileConfig, configDir string) (*StaticFileSo
 }
 
 // Resolve implements core.Handler — returns the least-used proxy.
-func (s *StaticFileSource) Resolve(_ context.Context, _ *core.Request) (*core.Result, error) {
-	p := s.pool.Next()
+// When a SessionSeed is present in context, tie-breaking is deterministic
+// so the same seed selects the same proxy (given equal use counts).
+// When nil (no session affinity), tie-breaking is random.
+func (s *StaticFileSource) Resolve(ctx context.Context, _ *core.Request) (*core.Result, error) {
+	p := s.pool.NextWithSeed(core.GetSessionSeed(ctx))
 	if p == nil {
 		return nil, fmt.Errorf("empty proxy pool")
 	}

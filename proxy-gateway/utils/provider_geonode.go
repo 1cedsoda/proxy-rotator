@@ -106,7 +106,8 @@ func NewGeonodeSource(cfg *GeonodeConfig) (*GeonodeSource, error) {
 }
 
 // Resolve implements core.Handler.
-func (s *GeonodeSource) Resolve(_ context.Context, _ *core.Request) (*core.Result, error) {
+func (s *GeonodeSource) Resolve(ctx context.Context, _ *core.Request) (*core.Result, error) {
+	seed := core.GetSessionSeed(ctx)
 	proto := core.ProtocolHTTP
 	if s.config.Protocol == GeonodeProtocolSocks5 {
 		proto = core.ProtocolSOCKS5
@@ -114,7 +115,7 @@ func (s *GeonodeSource) Resolve(_ context.Context, _ *core.Request) (*core.Resul
 	return core.Resolved(&core.Proxy{
 		Host:     s.config.Host(),
 		Port:     s.config.Port(),
-		Username: gnBuildUsername(&s.config),
+		Username: gnBuildUsername(&s.config, seed),
 		Password: s.password,
 		Protocol: proto,
 	}), nil
@@ -138,17 +139,12 @@ func (s *GeonodeSource) Describe() string {
 // Username building
 // ---------------------------------------------------------------------------
 
-func gnBuildUsername(cfg *GeonodeConfig) string {
-	country := gnPickCountry(cfg.Countries)
+func gnBuildUsername(cfg *GeonodeConfig, seed *core.SessionSeed) string {
+	country := pickCountry(cfg.Countries, seed)
 	if cfg.Session.Type == GeonodeSessionSticky {
-		return gnBuildSticky(cfg.Username, cfg.Session.SessTime, gnRandomSessionID(), country)
+		return gnBuildSticky(cfg.Username, cfg.Session.SessTime, deriveSessionID(seed), country)
 	}
 	return gnBuildRotating(cfg.Username, country)
-}
-
-// GeonodeRotateUsername rebuilds the username with a new session ID.
-func GeonodeRotateUsername(cfg *GeonodeConfig) string {
-	return gnBuildUsername(cfg)
 }
 
 func gnBuildRotating(username string, country Country) string {
@@ -168,17 +164,4 @@ func gnBuildSticky(username string, sessTime uint32, sessionID string, country C
 		parts = append(parts, fmt.Sprintf("country-%s", strings.ToUpper(country.AsParamStr())))
 	}
 	return strings.Join(parts, "-")
-}
-
-func gnPickCountry(countries []Country) Country {
-	if len(countries) == 0 {
-		return ""
-	}
-	return countries[int(CheapRandom())%len(countries)]
-}
-
-func gnRandomSessionID() string {
-	a := CheapRandom()
-	b := CheapRandom()
-	return fmt.Sprintf("%016x", a^(b<<32))
 }

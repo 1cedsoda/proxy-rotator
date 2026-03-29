@@ -1,19 +1,62 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
-	"proxy-gateway/core"
+	"proxy-gateway/utils"
 )
+
+// ---------------------------------------------------------------------------
+// API response types — match the TS client's expected schema
+// ---------------------------------------------------------------------------
 
 type apiError struct {
 	Error string `json:"error"`
 }
+
+type apiSessionInfo struct {
+	SessionID      uint64                 `json:"session_id"`
+	Username       string                 `json:"username"`
+	ProxySet       string                 `json:"proxy_set"`
+	Upstream       string                 `json:"upstream"`
+	CreatedAt      string                 `json:"created_at"`
+	NextRotationAt string                 `json:"next_rotation_at"`
+	LastRotationAt string                 `json:"last_rotation_at"`
+	Metadata       map[string]interface{} `json:"metadata"`
+}
+
+func toAPISessionInfo(info *utils.SessionInfo) *apiSessionInfo {
+	u, _ := ParseUsername(info.Label)
+
+	set := ""
+	meta := map[string]interface{}{}
+	if u != nil {
+		set = u.Affinity.Set
+		if u.Affinity.Meta != nil {
+			meta = u.Affinity.Meta
+		}
+	}
+
+	return &apiSessionInfo{
+		SessionID:      info.ID,
+		Username:       base64.StdEncoding.EncodeToString([]byte(info.Label)),
+		ProxySet:       set,
+		Upstream:       info.Upstream,
+		CreatedAt:      info.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		NextRotationAt: info.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z"),
+		LastRotationAt: info.LastRotationAt.UTC().Format("2006-01-02T15:04:05Z"),
+		Metadata:       meta,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Middleware & helpers
+// ---------------------------------------------------------------------------
 
 func bearerAuth(apiKey string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -27,41 +70,65 @@ func bearerAuth(apiKey string, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func handleListSessions(sessions *core.SessionHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		list := sessions.ListSessions()
-		if list == nil {
-			list = []core.SessionInfo{}
+func decodeBase64Username(encoded string) (*Username, error) {
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		raw, err = base64.URLEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, err
 		}
-		writeJSON(w, http.StatusOK, list)
+	}
+	return ParseUsername(string(raw))
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+func handleListSessions(sessions *utils.SessionManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		entries := sessions.ListEntries()
+		out := make([]apiSessionInfo, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, *toAPISessionInfo(&e))
+		}
+		writeJSON(w, http.StatusOK, out)
 	}
 }
 
-func handleGetSession(sessions *core.SessionHandler) http.HandlerFunc {
+func handleGetSession(sessions *utils.SessionManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := chi.URLParam(r, "key")
-		info := sessions.GetSession(key)
-		if info == nil {
-			writeJSON(w, http.StatusNotFound, apiError{Error: fmt.Sprintf("no active session for %q", key)})
+		u, err := decodeBase64Username(chi.URLParam(r, "username"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid username"})
 			return
 		}
-		writeJSON(w, http.StatusOK, info)
+		info := sessions.GetSession(u.Affinity.Seed())
+		if info == nil {
+			writeJSON(w, http.StatusNotFound, apiError{Error: "no active session"})
+			return
+		}
+		writeJSON(w, http.StatusOK, toAPISessionInfo(info))
 	}
 }
 
-func handleForceRotate(sessions *core.SessionHandler) http.HandlerFunc {
+func handleForceRotate(sessions *utils.SessionManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := chi.URLParam(r, "key")
-		info, err := sessions.ForceRotate(r.Context(), key)
+		u, err := decodeBase64Username(chi.URLParam(r, "username"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid username"})
+			return
+		}
+		info, err := sessions.ForceRotate(u.Affinity.Seed())
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
 			return
 		}
 		if info == nil {
-			writeJSON(w, http.StatusNotFound, apiError{Error: fmt.Sprintf("no active session for %q", key)})
+			writeJSON(w, http.StatusNotFound, apiError{Error: "no active session"})
 			return
 		}
-		writeJSON(w, http.StatusOK, info)
+		writeJSON(w, http.StatusOK, toAPISessionInfo(info))
 	}
 }
 

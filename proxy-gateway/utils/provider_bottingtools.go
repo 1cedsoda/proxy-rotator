@@ -133,7 +133,8 @@ func NewBottingtoolsSource(cfg *BottingtoolsConfig) (*BottingtoolsSource, error)
 
 // Resolve implements core.Handler.
 func (s *BottingtoolsSource) Resolve(ctx context.Context, _ *core.Request) (*core.Result, error) {
-	username := btBuildUsername(s.accountUser, s.product, GetMeta(ctx))
+	seed := core.GetSessionSeed(ctx)
+	username := btBuildUsername(s.accountUser, s.product, GetMeta(ctx), seed)
 	return core.Resolved(&core.Proxy{
 		Host:     s.host,
 		Port:     1337,
@@ -160,28 +161,28 @@ func (s *BottingtoolsSource) Describe() string {
 // Username building
 // ---------------------------------------------------------------------------
 
-func btBuildUsername(accountUser string, product BottingtoolsProductConfig, meta Meta) string {
+func btBuildUsername(accountUser string, product BottingtoolsProductConfig, meta Meta, seed *core.SessionSeed) string {
 	switch product.Type {
 	case "residential":
-		return btBuildResidential(accountUser, product.Residential, meta)
+		return btBuildResidential(accountUser, product.Residential, meta, seed)
 	case "isp":
-		return btBuildISP(accountUser, product.ISP, meta)
+		return btBuildISP(accountUser, product.ISP, meta, seed)
 	case "datacenter":
-		return btBuildDatacenter(accountUser, product.Datacenter)
+		return btBuildDatacenter(accountUser, product.Datacenter, seed)
 	default:
 		return accountUser
 	}
 }
 
-func btBuildResidential(accountUser string, cfg *BottingtoolsResidentialConfig, meta Meta) string {
+func btBuildResidential(accountUser string, cfg *BottingtoolsResidentialConfig, meta Meta, seed *core.SessionSeed) string {
 	parts := []string{fmt.Sprintf("%s_pool-custom_type-%s", accountUser, cfg.Quality.AsTypeStr())}
-	if country := btPickCountry(cfg.Countries); country != "" {
+	if country := pickCountry(cfg.Countries, seed); country != "" {
 		parts = append(parts, fmt.Sprintf("country-%s", strings.ToUpper(country.AsParamStr())))
 	}
 	if cfg.City != "" {
 		parts = append(parts, fmt.Sprintf("city-%s", cfg.City))
 	}
-	parts = append(parts, fmt.Sprintf("session-%s", btRandomSessionID()))
+	parts = append(parts, fmt.Sprintf("session-%s", deriveSessionID(seed)))
 	if v := btSesstimeStr(meta); v != "" {
 		parts = append(parts, fmt.Sprintf("sesstime-%s", v))
 	}
@@ -191,45 +192,24 @@ func btBuildResidential(accountUser string, cfg *BottingtoolsResidentialConfig, 
 	return strings.Join(parts, "_")
 }
 
-func btBuildISP(accountUser string, cfg *BottingtoolsISPConfig, meta Meta) string {
+func btBuildISP(accountUser string, cfg *BottingtoolsISPConfig, meta Meta, seed *core.SessionSeed) string {
 	parts := []string{fmt.Sprintf("%s_pool-isp", accountUser)}
-	if country := btPickCountry(cfg.Countries); country != "" {
+	if country := pickCountry(cfg.Countries, seed); country != "" {
 		parts = append(parts, fmt.Sprintf("country-%s", country.AsParamStr()))
 	}
-	parts = append(parts, fmt.Sprintf("session-%s", btRandomSessionID()))
+	parts = append(parts, fmt.Sprintf("session-%s", deriveSessionID(seed)))
 	if v := btSesstimeStr(meta); v != "" {
 		parts = append(parts, fmt.Sprintf("sesstime-%s", v))
 	}
 	return strings.Join(parts, "_")
 }
 
-func btBuildDatacenter(accountUser string, cfg *BottingtoolsDatacenterConfig) string {
+func btBuildDatacenter(accountUser string, cfg *BottingtoolsDatacenterConfig, seed *core.SessionSeed) string {
 	parts := []string{fmt.Sprintf("%s_pool-dc", accountUser)}
-	if country := btPickCountry(cfg.Countries); country != "" {
+	if country := pickCountry(cfg.Countries, seed); country != "" {
 		parts = append(parts, fmt.Sprintf("country-%s", country.AsParamStr()))
 	}
 	return strings.Join(parts, "_")
-}
-
-// BottingtoolsRotateSessionID replaces the session ID in a bottingtools username.
-func BottingtoolsRotateSessionID(username string) string {
-	newID := btRandomSessionID()
-	parts := strings.Split(username, "_")
-	replaced := false
-	for i, part := range parts {
-		if !replaced && strings.HasPrefix(part, "session-") {
-			parts[i] = "session-" + newID
-			replaced = true
-		}
-	}
-	return strings.Join(parts, "_")
-}
-
-func btPickCountry(countries []Country) Country {
-	if len(countries) == 0 {
-		return ""
-	}
-	return countries[int(CheapRandom())%len(countries)]
 }
 
 func btSesstimeStr(meta Meta) string {
@@ -245,10 +225,4 @@ func btSesstimeStr(meta Meta) string {
 	default:
 		return fmt.Sprintf("%v", vv)
 	}
-}
-
-func btRandomSessionID() string {
-	a := CheapRandom()
-	b := CheapRandom()
-	return fmt.Sprintf("%016x", a^(b<<32))
 }

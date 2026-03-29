@@ -20,12 +20,6 @@ type Config struct {
 	AdminAddr  string `toml:"admin_addr"  yaml:"admin_addr"  json:"admin_addr"`
 	LogLevel   string `toml:"log_level"  yaml:"log_level"  json:"log_level"`
 
-	// Auth supports a single user via sub+password, or multiple users via Users map.
-	// If both are set, Users takes precedence.
-	AuthSub      string            `toml:"auth_sub"      yaml:"auth_sub"      json:"auth_sub"`
-	AuthPassword string            `toml:"auth_password" yaml:"auth_password" json:"auth_password"`
-	Users        map[string]string `toml:"users"         yaml:"users"         json:"users"`
-
 	ProxySets []ProxySetConfig `toml:"proxy_set" yaml:"proxy_set" json:"proxy_set"`
 }
 
@@ -38,17 +32,6 @@ type ProxySetConfig struct {
 	StaticFile   *utils.StaticFileConfig   `toml:"static_file"  yaml:"static_file"  json:"static_file"`
 	Bottingtools *utils.BottingtoolsConfig `toml:"bottingtools" yaml:"bottingtools" json:"bottingtools"`
 	Geonode      *utils.GeonodeConfig      `toml:"geonode"      yaml:"geonode"      json:"geonode"`
-}
-
-// authUsers returns the effective user map from config.
-func (c *Config) authUsers() (map[string]string, error) {
-	if len(c.Users) > 0 {
-		return c.Users, nil
-	}
-	if c.AuthSub != "" && c.AuthPassword != "" {
-		return map[string]string{c.AuthSub: c.AuthPassword}, nil
-	}
-	return nil, fmt.Errorf("no auth configured: set users or auth_sub+auth_password")
 }
 
 // LoadConfig reads and parses a TOML, YAML, or JSON config file.
