@@ -1,18 +1,11 @@
 // Package examples contains example middleware for the proxy gateway pipeline.
-//
-// The TLS fingerprint middleware demonstrates how to use httpcloak with
-// the MITM infrastructure to make upstream connections look like a real browser.
 package examples
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -22,115 +15,36 @@ import (
 	"proxy-gateway/core"
 )
 
-// Fingerprint returns middleware that performs TLS interception and re-connects
-// to the target using httpcloak with a browser-identical TLS/HTTP2 fingerprint.
+// Fingerprint returns MITM middleware that uses httpcloak to spoof the
+// upstream TLS fingerprint as a real browser.
+//
+// Instead of duplicating TLS termination logic, this uses core.MITM with
+// a custom Interceptor that forwards via httpcloak instead of Go's crypto/tls.
 //
 // Usage:
 //
 //	ca, _ := core.NewCA()
-//	pipeline := core.Auth(auth,
-//	    examples.Fingerprint(ca, "chrome-latest",
+//	pipeline := examples.Fingerprint(ca, "chrome-latest",
+//	    core.Auth(auth,
 //	        core.Session(source),
 //	    ),
 //	)
 //	core.ListenHTTP(":8100", pipeline)
 func Fingerprint(ca tls.Certificate, preset string, inner core.Handler) core.Handler {
-	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	certs, err := core.NewForgedCertProvider(ca)
 	if err != nil {
-		panic(fmt.Sprintf("fingerprint: failed to parse CA certificate: %v", err))
+		panic(fmt.Sprintf("fingerprint: %v", err))
 	}
-	return &fingerprintHandler{
-		inner:  inner,
-		ca:     ca,
-		caCert: caCert,
-		preset: preset,
-		cache:  &core.CertCache{},
-	}
+	return core.MITM(certs, &FingerprintInterceptor{Preset: preset}, inner)
 }
 
-type fingerprintHandler struct {
-	inner  core.Handler
-	ca     tls.Certificate
-	caCert *x509.Certificate
-	preset string
-	cache  *core.CertCache
+// FingerprintInterceptor forwards requests using httpcloak with a browser
+// TLS fingerprint preset. Implements core.Interceptor.
+type FingerprintInterceptor struct {
+	Preset string
 }
 
-func (h *fingerprintHandler) Resolve(ctx context.Context, req *core.Request) (*core.Result, error) {
-	// Only intercept CONNECT with a raw connection and TLS not already broken.
-	if req.Conn == nil {
-		return h.inner.Resolve(ctx, req)
-	}
-	if ts := core.GetTLSState(ctx); ts.Broken {
-		return h.inner.Resolve(ctx, req)
-	}
-
-	host := targetHost(req.Target)
-	cert := h.cache.Get(host, h.caCert, &h.ca)
-
-	tlsConn := tls.Server(req.Conn, &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		slog.Debug("fingerprint: TLS handshake failed", "host", host, "err", err)
-		req.Conn.Close()
-		return nil, nil
-	}
-
-	slog.Debug("fingerprint: intercepting", "host", host, "preset", h.preset)
-
-	childCtx := core.WithTLSState(ctx, core.TLSState{
-		Broken:     true,
-		ServerName: host,
-	})
-
-	br := bufio.NewReader(tlsConn)
-	for {
-		httpReq, err := http.ReadRequest(br)
-		if err != nil {
-			break
-		}
-
-		child := &core.Request{
-			RawUsername: req.RawUsername,
-			RawPassword: req.RawPassword,
-			Target:      host + ":443",
-			HTTPRequest: httpReq,
-		}
-
-		result, resolveErr := h.inner.Resolve(childCtx, child)
-
-		if result != nil && result.HTTPResponse != nil {
-			result.HTTPResponse.Write(tlsConn)
-			continue
-		}
-		if resolveErr != nil {
-			writeErr(tlsConn, http.StatusForbidden, resolveErr.Error())
-			continue
-		}
-		if result == nil || result.Proxy == nil {
-			writeErr(tlsConn, http.StatusServiceUnavailable, "no proxy available")
-			continue
-		}
-
-		resp, fwdErr := forwardWithFingerprint(ctx, httpReq, host, result.Proxy, h.preset)
-		if fwdErr != nil {
-			writeErr(tlsConn, http.StatusBadGateway, fwdErr.Error())
-			continue
-		}
-
-		if result.ResponseHook != nil {
-			resp = result.ResponseHook(resp)
-		}
-
-		resp.Write(tlsConn)
-	}
-
-	tlsConn.Close()
-	return nil, nil
-}
-
-func forwardWithFingerprint(ctx context.Context, httpReq *http.Request, host string, proxy *core.Proxy, preset string) (*http.Response, error) {
+func (f *FingerprintInterceptor) RoundTrip(ctx context.Context, httpReq *http.Request, host string, proxy *core.Proxy) (*http.Response, error) {
 	var proxyURL string
 	switch proxy.Proto() {
 	case core.ProtocolSOCKS5:
@@ -153,7 +67,7 @@ func forwardWithFingerprint(ctx context.Context, httpReq *http.Request, host str
 	if proxyURL != "" {
 		opts = append(opts, client.WithProxy(proxyURL))
 	}
-	c := client.NewClient(preset, opts...)
+	c := client.NewClient(f.Preset, opts...)
 	defer c.Close()
 
 	targetURL := fmt.Sprintf("https://%s%s", host, httpReq.URL.RequestURI())
@@ -198,25 +112,4 @@ func forwardWithFingerprint(ctx context.Context, httpReq *http.Request, host str
 	}
 
 	return httpResp, nil
-}
-
-func writeErr(w io.Writer, status int, msg string) {
-	resp := &http.Response{
-		StatusCode: status,
-		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     http.Header{"Content-Type": {"text/plain"}},
-		Body:       io.NopCloser(strings.NewReader(msg)),
-	}
-	resp.Write(w)
-}
-
-func targetHost(target string) string {
-	h, _, err := net.SplitHostPort(target)
-	if err != nil {
-		return target
-	}
-	return h
 }

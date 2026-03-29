@@ -20,126 +20,38 @@ import (
 	"time"
 )
 
-// MITM creates TLS-interception middleware. It terminates the client's TLS
-// using a forged certificate, reads each HTTP request from the decrypted
-// stream, and resolves it through the inner handler pipeline.
+// ---------------------------------------------------------------------------
+// Interceptor — how decrypted requests reach the target
+// ---------------------------------------------------------------------------
+
+// Interceptor controls how a decrypted HTTP request is forwarded to the
+// target server through an upstream proxy.
 //
-// The upstream parameter is used to dial the target through the resolved proxy.
-// This eliminates the duplicated upstream dialer code.
+// Built-in:
+//   - StandardInterceptor: Go crypto/tls via core.Upstream
 //
-// Usage:
-//
-//	ca, _ := middleware.NewCA()
-//	upstream := gateway.AutoUpstream()   // or custom
-//	pipeline := Auth(auth,
-//	    MITM(ca, upstream,
-//	        Session(source),
-//	    ),
-//	)
-func MITM(ca tls.Certificate, upstream Upstream, inner Handler) Handler {
-	caCert, err := x509.ParseCertificate(ca.Certificate[0])
-	if err != nil {
-		panic(fmt.Sprintf("mitm: failed to parse CA certificate: %v", err))
-	}
-	return &mitmHandler{
-		inner:    inner,
-		upstream: upstream,
-		ca:       ca,
-		caCert:   caCert,
-		cache:    &CertCache{},
-	}
+// Custom implementations can use httpcloak for TLS fingerprint spoofing,
+// a custom HTTP client, or anything else that produces an *http.Response.
+type Interceptor interface {
+	RoundTrip(ctx context.Context, req *http.Request, host string, proxy *Proxy) (*http.Response, error)
 }
 
-type mitmHandler struct {
-	inner    Handler
-	upstream Upstream
-	ca       tls.Certificate
-	caCert   *x509.Certificate
-	cache    *CertCache
+// InterceptorFunc adapts a function to the Interceptor interface.
+type InterceptorFunc func(ctx context.Context, req *http.Request, host string, proxy *Proxy) (*http.Response, error)
+
+func (f InterceptorFunc) RoundTrip(ctx context.Context, req *http.Request, host string, proxy *Proxy) (*http.Response, error) {
+	return f(ctx, req, host, proxy)
 }
 
-func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error) {
-	// Only intercept tunnel connections (CONNECT / SOCKS5).
-	if req.Conn == nil {
-		return m.inner.Resolve(ctx, req)
-	}
-
-	// Don't double-intercept.
-	if ts := GetTLSState(ctx); ts.Broken {
-		return m.inner.Resolve(ctx, req)
-	}
-
-	host := targetHost(req.Target)
-	cert := m.cache.Get(host, m.caCert, &m.ca)
-
-	tlsConn := tls.Server(req.Conn, &tls.Config{
-		Certificates: []tls.Certificate{*cert},
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		slog.Debug("MITM TLS handshake failed", "host", host, "err", err)
-		req.Conn.Close()
-		return nil, nil // handled (failed)
-	}
-
-	slog.Debug("MITM TLS intercepting", "host", host)
-
-	// Set TLS state in context for child requests.
-	childCtx := WithTLSState(ctx, TLSState{
-		Broken:     true,
-		ServerName: host,
-	})
-
-	br := bufio.NewReader(tlsConn)
-	for {
-		httpReq, err := http.ReadRequest(br)
-		if err != nil {
-			break // client closed or error
-		}
-
-		childReq := &Request{
-			RawUsername: req.RawUsername,
-			RawPassword: req.RawPassword,
-			Target:      host + ":443",
-			HTTPRequest: httpReq,
-		}
-
-		result, resolveErr := m.inner.Resolve(childCtx, childReq)
-
-		// Synthetic response from middleware.
-		if result != nil && result.HTTPResponse != nil {
-			result.HTTPResponse.Write(tlsConn)
-			continue
-		}
-
-		if resolveErr != nil {
-			writeErrorResponse(tlsConn, http.StatusForbidden, resolveErr.Error())
-			continue
-		}
-		if result == nil || result.Proxy == nil {
-			writeErrorResponse(tlsConn, http.StatusServiceUnavailable, "no proxy available")
-			continue
-		}
-
-		resp, fwdErr := m.forwardHTTPRequest(ctx, httpReq, host, result.Proxy)
-		if fwdErr != nil {
-			writeErrorResponse(tlsConn, http.StatusBadGateway, fwdErr.Error())
-			continue
-		}
-
-		if result.ResponseHook != nil {
-			resp = result.ResponseHook(resp)
-		}
-
-		resp.Write(tlsConn)
-	}
-
-	tlsConn.Close()
-	return nil, nil // we handled it
+// StandardInterceptor forwards decrypted requests using Go's crypto/tls
+// through a core.Upstream dialer. This is the default.
+type StandardInterceptor struct {
+	Upstream Upstream
 }
 
-func (m *mitmHandler) forwardHTTPRequest(ctx context.Context, httpReq *http.Request, host string, proxy *Proxy) (*http.Response, error) {
+func (s *StandardInterceptor) RoundTrip(ctx context.Context, httpReq *http.Request, host string, proxy *Proxy) (*http.Response, error) {
 	target := host + ":443"
-	upstreamConn, err := m.upstream.Dial(ctx, proxy, target)
+	upstreamConn, err := s.Upstream.Dial(ctx, proxy, target)
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +76,198 @@ func (m *mitmHandler) forwardHTTPRequest(ctx context.Context, httpReq *http.Requ
 		return nil, fmt.Errorf("reading response from target: %w", err)
 	}
 	return resp, nil
+}
+
+// ---------------------------------------------------------------------------
+// CertProvider — how client-facing TLS certs are obtained
+// ---------------------------------------------------------------------------
+
+// CertProvider returns a TLS certificate to present to the client for a
+// given hostname.
+type CertProvider interface {
+	CertForHost(host string) (*tls.Certificate, error)
+}
+
+// ForgedCertProvider forges certificates on-the-fly signed by a CA.
+type ForgedCertProvider struct {
+	CA     tls.Certificate
+	caCert *x509.Certificate
+	cache  *CertCache
+}
+
+// NewForgedCertProvider creates a CertProvider that forges per-host certs.
+func NewForgedCertProvider(ca tls.Certificate) (*ForgedCertProvider, error) {
+	caCert, err := x509.ParseCertificate(ca.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parsing CA certificate: %w", err)
+	}
+	return &ForgedCertProvider{
+		CA:     ca,
+		caCert: caCert,
+		cache:  &CertCache{},
+	}, nil
+}
+
+func (p *ForgedCertProvider) CertForHost(host string) (*tls.Certificate, error) {
+	return p.cache.Get(host, p.caCert, &p.CA), nil
+}
+
+// StaticCertProvider always returns the same certificate.
+type StaticCertProvider struct {
+	Cert tls.Certificate
+}
+
+func (p *StaticCertProvider) CertForHost(_ string) (*tls.Certificate, error) {
+	return &p.Cert, nil
+}
+
+// ---------------------------------------------------------------------------
+// MITM — TLS termination loop
+// ---------------------------------------------------------------------------
+
+// MITM creates TLS-interception middleware. It terminates the client's TLS,
+// reads each HTTP request, resolves an upstream proxy through the inner
+// Handler pipeline, and forwards the request via the Interceptor.
+//
+// The inner Handler pipeline handles everything else — auth, rate limiting,
+// logging, request blocking, response modification. Each decrypted HTTP
+// request is fed through inner.Resolve() as a child Request with TLSState
+// set in context.
+//
+// Basic usage:
+//
+//	ca, _ := core.NewCA()
+//	certs, _ := core.NewForgedCertProvider(ca)
+//	interceptor := &core.StandardInterceptor{Upstream: upstream}
+//	pipeline := core.MITM(certs, interceptor, inner)
+//
+// With logging middleware in the inner pipeline:
+//
+//	pipeline := core.MITM(certs, interceptor,
+//	    myLogger(               // logs every decrypted request
+//	        core.Auth(auth,
+//	            core.Session(source),
+//	        ),
+//	    ),
+//	)
+//
+// With request blocking in the inner pipeline:
+//
+//	blocker := core.HandlerFunc(func(ctx context.Context, req *core.Request) (*core.Result, error) {
+//	    if req.HTTPRequest != nil && isBlocked(req.HTTPRequest.URL.Host) {
+//	        return &core.Result{HTTPResponse: blocked403()}, nil
+//	    }
+//	    return inner.Resolve(ctx, req)
+//	})
+//	pipeline := core.MITM(certs, interceptor, blocker)
+func MITM(certs CertProvider, interceptor Interceptor, inner Handler) Handler {
+	return &mitmHandler{
+		inner:       inner,
+		certs:       certs,
+		interceptor: interceptor,
+	}
+}
+
+// QuickMITM is a convenience for the common case: forged certs from a CA
+// + standard Go TLS forwarding via Upstream.
+func QuickMITM(ca tls.Certificate, upstream Upstream, inner Handler) Handler {
+	certs, err := NewForgedCertProvider(ca)
+	if err != nil {
+		panic(fmt.Sprintf("mitm: %v", err))
+	}
+	return MITM(certs, &StandardInterceptor{Upstream: upstream}, inner)
+}
+
+type mitmHandler struct {
+	inner       Handler
+	certs       CertProvider
+	interceptor Interceptor
+}
+
+func (m *mitmHandler) Resolve(ctx context.Context, req *Request) (*Result, error) {
+	// Only intercept tunnel connections (CONNECT / SOCKS5).
+	if req.Conn == nil {
+		return m.inner.Resolve(ctx, req)
+	}
+
+	// Don't double-intercept.
+	if ts := GetTLSState(ctx); ts.Broken {
+		return m.inner.Resolve(ctx, req)
+	}
+
+	host := targetHost(req.Target)
+
+	cert, err := m.certs.CertForHost(host)
+	if err != nil {
+		slog.Debug("MITM cert error", "host", host, "err", err)
+		req.Conn.Close()
+		return nil, nil
+	}
+
+	tlsConn := tls.Server(req.Conn, &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		slog.Debug("MITM TLS handshake failed", "host", host, "err", err)
+		req.Conn.Close()
+		return nil, nil
+	}
+
+	slog.Debug("MITM intercepting", "host", host)
+
+	childCtx := WithTLSState(ctx, TLSState{
+		Broken:     true,
+		ServerName: host,
+	})
+
+	br := bufio.NewReader(tlsConn)
+	for {
+		httpReq, err := http.ReadRequest(br)
+		if err != nil {
+			break
+		}
+
+		childReq := &Request{
+			RawUsername: req.RawUsername,
+			RawPassword: req.RawPassword,
+			Target:      host + ":443",
+			HTTPRequest: httpReq,
+		}
+
+		result, resolveErr := m.inner.Resolve(childCtx, childReq)
+
+		// Synthetic response from pipeline middleware.
+		if result != nil && result.HTTPResponse != nil {
+			result.HTTPResponse.Write(tlsConn)
+			continue
+		}
+
+		if resolveErr != nil {
+			writeErrorResponse(tlsConn, http.StatusForbidden, resolveErr.Error())
+			continue
+		}
+		if result == nil || result.Proxy == nil {
+			writeErrorResponse(tlsConn, http.StatusServiceUnavailable, "no proxy available")
+			continue
+		}
+
+		// Forward through the interceptor.
+		resp, fwdErr := m.interceptor.RoundTrip(childCtx, httpReq, host, result.Proxy)
+		if fwdErr != nil {
+			writeErrorResponse(tlsConn, http.StatusBadGateway, fwdErr.Error())
+			continue
+		}
+
+		// Pipeline response hooks.
+		if result.ResponseHook != nil {
+			resp = result.ResponseHook(resp)
+		}
+
+		resp.Write(tlsConn)
+	}
+
+	tlsConn.Close()
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +299,7 @@ func writeErrorResponse(w io.Writer, status int, msg string) {
 // Certificate cache
 // ---------------------------------------------------------------------------
 
-// CertCache caches forged TLS certificates keyed by hostname.
+// CertCache caches TLS certificates keyed by hostname.
 type CertCache struct {
 	mu    sync.RWMutex
 	certs map[string]*tls.Certificate
