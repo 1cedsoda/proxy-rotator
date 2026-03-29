@@ -3,17 +3,13 @@ module proxy-kit
 go 1.26.1
 
 require (
-	github.com/BurntSushi/toml v1.6.0
-	github.com/go-chi/chi/v5 v5.2.5
 	github.com/sardanioss/httpcloak v1.6.1
 	golang.org/x/net v0.52.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
-	github.com/kr/text v0.2.0 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/sardanioss/http v1.2.0 // indirect
 	github.com/sardanioss/net v1.2.5 // indirect
